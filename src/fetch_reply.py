@@ -62,7 +62,7 @@ if MAIL_SEND_ENABLED and FORCE_DRAFTS:
     logger.warning("If you want to actually send emails, set FORCE_DRAFTS=False")
 
 # API configuration for the model server
-MODEL_API_URL = os.getenv("MODEL_API_URL","http://35.188.121.145:8000/")
+MODEL_API_URL = os.getenv("MODEL_API_URL","http://34.72.113.155:8000/")
 
 # Updated list of allowed labels
 ALLOWED_LABELS = [
