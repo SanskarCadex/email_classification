@@ -15,7 +15,7 @@ et_xmlfile==2.0.0
 Flask==2.3.3
 flask-cors==6.0.1
 fonttools==4.58.4
-h11==0.14.0
+h11==0.16.0
 httpcore==0.18.0
 httpx==0.25.0
 idna==3.10
