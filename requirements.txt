@@ -32,7 +32,7 @@ openpyxl==3.1.2
 packaging==25.0
 pandas==2.0.3
 paramiko==3.3.1
-pillow==11.2.0
+pillow==11.3.0
 psycopg2-binary==2.9.7
 pycparser==2.22
 pydantic==2.11.7
