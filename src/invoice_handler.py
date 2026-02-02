@@ -37,21 +37,38 @@ from src.log_config import logger
 load_dotenv()
 
 
+# ============================================================================
+# HARDCODED FLAG: Set to False to completely disable invoice handler
+# ============================================================================
+# This flag is hardcoded in the file to allow quick disable without env changes
+# When False, all invoice handler methods will return early without processing
+INVOICE_HANDLER_ENABLED = False  # Set to False to disable entire invoice handler
+
 # URL of the VM invoice fetch API (Docker service on the VM)
 # Example: http://34.170.59.164:5001/fetch-invoices
 INVOICE_FETCH_URL = os.getenv("INVOICE_FETCH_URL")
 
-# Enable/disable invoice handler (default: false)
+# Enable/disable invoice handler via environment variable (default: false)
+# This works in conjunction with INVOICE_HANDLER_ENABLED flag above
 ENABLE_INVOICE_HANDLER = os.getenv("ENABLE_INVOICE_HANDLER", "false").lower() == "true"
 
 # Password used by VDI to decrypt the AES-encrypted ZIP
-# Must be set via .env for security
+# Must be set via .env for security (no hardcoded default)
 ZIP_PASSWORD = os.getenv("ZIP_PASSWORD", "").encode("utf-8")
 
-if ENABLE_INVOICE_HANDLER and not ZIP_PASSWORD:
+# Check if handler should be enabled (both flags must be True)
+HANDLER_ACTIVE = INVOICE_HANDLER_ENABLED and ENABLE_INVOICE_HANDLER
+
+if HANDLER_ACTIVE and not ZIP_PASSWORD:
     logger.warning(
         "ZIP_PASSWORD not set in environment; "
         "encrypted ZIPs will fail to decrypt."
+    )
+
+if not INVOICE_HANDLER_ENABLED:
+    logger.info(
+        "Invoice handler is DISABLED by hardcoded flag INVOICE_HANDLER_ENABLED=False. "
+        "Set INVOICE_HANDLER_ENABLED = True in invoice_handler.py to enable."
     )
 
 if not INVOICE_FETCH_URL:
@@ -89,11 +106,18 @@ class InvoiceHandler:
         timeout: int = 60,
         session: Optional[requests.Session] = None,
     ):
+        # Check hardcoded flag first
+        if not INVOICE_HANDLER_ENABLED:
+            logger.info(
+                "InvoiceHandler initialized but disabled by INVOICE_HANDLER_ENABLED=False. "
+                "All methods will return early."
+            )
+        
         self.base_url = base_url or INVOICE_FETCH_URL
         self.timeout = timeout
         self.session = session or requests.Session()
 
-        if not self.base_url:
+        if not self.base_url and INVOICE_HANDLER_ENABLED:
             logger.error(
                 "InvoiceHandler initialised without INVOICE_FETCH_URL. "
                 "Set INVOICE_FETCH_URL in your .env file."
@@ -228,16 +252,27 @@ class InvoiceHandler:
             Returns PDF (single invoice) or ZIP (multiple matches),
             depending on what the VM returns.
         """
-        # Global kill switch: allow turning off the entire invoice flow from config.
+        # Global kill switch: check hardcoded flag first, then env flag
         # When disabled, we do NOT call the VM and simply return a disabled result.
-        if not ENABLE_INVOICE_HANDLER:
-            logger.info(
-                "InvoiceHandler is disabled by ENABLE_INVOICE_HANDLER flag; "
-                "skipping invoice fetch."
-            )
+        if not HANDLER_ACTIVE:
+            if not INVOICE_HANDLER_ENABLED:
+                logger.info(
+                    "InvoiceHandler is disabled by hardcoded flag INVOICE_HANDLER_ENABLED=False; "
+                    "skipping invoice fetch."
+                )
+                error_msg = "Invoice handler disabled by hardcoded flag"
+            elif not ENABLE_INVOICE_HANDLER:
+                logger.info(
+                    "InvoiceHandler is disabled by ENABLE_INVOICE_HANDLER env flag; "
+                    "skipping invoice fetch."
+                )
+                error_msg = "Invoice handler disabled by environment configuration"
+            else:
+                error_msg = "Invoice handler disabled"
+            
             return InvoiceFetchResult(
                 success=False,
-                error="Invoice handler disabled by configuration",
+                error=error_msg,
                 request_payload={
                     "company_name": company_name,
                     "abcfn_number": abcfn_number,
