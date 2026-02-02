@@ -41,9 +41,18 @@ load_dotenv()
 # Example: http://34.170.59.164:5001/fetch-invoices
 INVOICE_FETCH_URL = os.getenv("INVOICE_FETCH_URL")
 
+# Enable/disable invoice handler (default: false)
+ENABLE_INVOICE_HANDLER = os.getenv("ENABLE_INVOICE_HANDLER", "false").lower() == "true"
+
 # Password used by VDI to decrypt the AES-encrypted ZIP
-# Default: "abccollect" (can be overridden via .env)
-ZIP_PASSWORD = os.getenv("ZIP_PASSWORD", "abccollect").encode("utf-8")
+# Must be set via .env for security
+ZIP_PASSWORD = os.getenv("ZIP_PASSWORD", "").encode("utf-8")
+
+if ENABLE_INVOICE_HANDLER and not ZIP_PASSWORD:
+    logger.warning(
+        "ZIP_PASSWORD not set in environment; "
+        "encrypted ZIPs will fail to decrypt."
+    )
 
 if not INVOICE_FETCH_URL:
     logger.warning(
@@ -51,13 +60,6 @@ if not INVOICE_FETCH_URL:
         "invoice_handler will be disabled until configured."
     )
 
-# Global feature flag to enable/disable the entire invoice handler flow.
-# When False:
-#   - No invoice VM calls are made
-#   - Caller can choose to skip generating the second invoice email
-# Default is False so that integration can be turned on explicitly via env.
-# Set to "true" to enable invoice fetching via VM proxy.
-ENABLE_INVOICE_HANDLER = os.getenv("ENABLE_INVOICE_HANDLER", "false").lower() == "true"
 
 
 @dataclass
@@ -112,7 +114,7 @@ class InvoiceHandler:
         abcfn_number = abcfn_number.strip()
         # Remove a single leading underscore, if present
         if abcfn_number.startswith("_"):
-            return abcfn_number.lstrip("_")
+            return abcfn_number[1:]
         return abcfn_number
 
     def _decrypt_and_rezip(self, encrypted_zip_bytes: bytes) -> bytes:
@@ -161,7 +163,7 @@ class InvoiceHandler:
             
             with zipfile.ZipFile(temp_zip_path.name, "w", zipfile.ZIP_DEFLATED) as zf:
                 # Walk through extracted directory and add all files
-                for root, dirs, files in os.walk(temp_extract_dir):
+                for root, _dirs, files in os.walk(temp_extract_dir):
                     for file in files:
                         file_path = os.path.join(root, file)
                         # Calculate relative path from extract directory
@@ -283,7 +285,7 @@ class InvoiceHandler:
             # Enhanced error logging matching VM proxy improvements
             error_msg = data.get("error") or "Invoice VM API error"
             logger.warning(
-                f"Invoice VM API returned JSON error response",
+                "Invoice VM API returned JSON error response",
                 extra={"status": resp.status_code, "data": data},
             )
             logger.warning(f"  Status: {resp.status_code}")
@@ -292,15 +294,15 @@ class InvoiceHandler:
             
             # Provide helpful context for common errors
             if resp.status_code == 404:
-                logger.warning(f"  This usually means:")
-                logger.warning(f"    - Company folder not found in CSV or filesystem")
-                logger.warning(f"    - ABCFN folder not found (tried with/without underscore)")
-                logger.warning(f"    - Invoices folder not found inside ABCFN folder")
+                logger.warning("  This usually means:")
+                logger.warning("    - Company folder not found in CSV or filesystem")
+                logger.warning("    - ABCFN folder not found (tried with/without underscore)")
+                logger.warning("    - Invoices folder not found inside ABCFN folder")
                 logger.warning(f"  Requested: company='{company_name}', abcfn='{abcfn_number}'")
             elif resp.status_code == 503:
-                logger.warning(f"  VDI service is unreachable (connection error)")
+                logger.warning("  VDI service is unreachable (connection error)")
             elif resp.status_code == 504:
-                logger.warning(f"  VDI service timeout (request took too long)")
+                logger.warning("  VDI service timeout (request took too long)")
 
             return InvoiceFetchResult(
                 success=False,
