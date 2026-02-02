@@ -205,13 +205,12 @@ class DocumentReader:
             logger.error(f"PDF OCR extraction error: {e}")
             return ""
     
-    def extract_from_image(self, image_bytes: bytes, image_format: str = None) -> str:
+    def extract_from_image(self, image_bytes: bytes) -> str:
         """
         Extract text from image using Tesseract OCR.
         
         Args:
             image_bytes: Image file content as bytes
-            image_format: Image format (PNG, JPEG, etc.) - auto-detected if None
             
         Returns:
             Extracted text string
@@ -248,15 +247,20 @@ class DocumentReader:
             Extracted text string
         """
         try:
-            # Try UTF-8 first
+            # Try specified encoding first
             try:
-                return text_bytes.decode('utf-8')
+                return text_bytes.decode(encoding)
             except UnicodeDecodeError:
-                # Fallback to latin-1 or other encodings
+                # Fallback to utf-8
                 try:
-                    return text_bytes.decode('latin-1')
+                    return text_bytes.decode('utf-8')
                 except UnicodeDecodeError:
-                    return text_bytes.decode('utf-8', errors='ignore')
+                    # Fallback to latin-1
+                    try:
+                        return text_bytes.decode('latin-1')
+                    except UnicodeDecodeError:
+                        # Final fallback: use specified encoding with errors='ignore'
+                        return text_bytes.decode(encoding, errors='ignore')
         except Exception as e:
             logger.error(f"Error extracting text from text file: {e}")
             return ""
@@ -301,13 +305,8 @@ class DocumentReader:
                 logger.info(f"Attempting OCR extraction for image file: {filename}")
                 return self.extract_from_image(file_bytes)
         
-        # Try PDF extraction for unknown types if filename suggests PDF
-        if filename and filename.lower().endswith('.pdf'):
-            logger.info(f"Attempting PDF extraction for file: {filename}")
-            return self.extract_from_pdf(file_bytes)
-        
         logger.warning(f"Unsupported content type for text extraction: {content_type} (filename: {filename})")
-        logger.info(f"Supported types: PDF, images (PNG/JPG/JPEG/GIF/BMP/TIFF), text files (TXT/CSV/LOG)")
+        logger.info("Supported types: PDF, images (PNG/JPG/JPEG/GIF/BMP/TIFF), text files (TXT/CSV/LOG)")
         return ""
 
 

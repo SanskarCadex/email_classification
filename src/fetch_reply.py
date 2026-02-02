@@ -1269,14 +1269,14 @@ class EmailProcessor:
                                             for p in invoice_file_paths:
                                                 try:
                                                     os.remove(p)
-                                                except Exception:
-                                                    pass
+                                                except Exception as e:
+                                                    logger.debug(f"Failed to remove temp file {p}: {e}")
                                             try:
                                                 os.rmdir(temp_dir)
-                                            except Exception:
-                                                pass
-                                    except Exception:
-                                        pass
+                                            except Exception as e:
+                                                logger.debug(f"Failed to remove temp dir {temp_dir}: {e}")
+                                    except Exception as e:
+                                        logger.debug(f"Cleanup error: {e}")
                                 
                                 # If configured, send the second draft (with or without attachment)
                                 if SEND_INVOICE_WITH_ATTACHMENT:
@@ -1409,9 +1409,7 @@ class EmailProcessor:
                         
                         if not draft_id:
                             logger.error(f"❌ CRITICAL: Draft NOT created after 3 attempts - email {message_id} will be processed without draft")
-                            draft_created = True
-                        else:
-                            logger.warning(f"Threaded draft save failed")
+                            # draft_created remains False (default)
         
         # CHECK UNIFIED STOP BEFORE MONGODB STORAGE
         if self.stop_event.is_set():
