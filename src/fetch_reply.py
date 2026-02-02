@@ -19,11 +19,14 @@ import httpx
 import msal
 import requests
 import re
+import tempfile
 from datetime import datetime
 from typing import Dict, Optional, List, Any, Tuple
 from dotenv import load_dotenv
 from src.db import get_mongo, PostgresHelper
 from src.log_config import logger
+from src.doc_handler import get_formatted_attachment_content_for_classification
+from src.invoice_handler import InvoiceHandler
 
 load_dotenv()
 
@@ -38,6 +41,7 @@ MODEL_API_URL = "http://104.197.197.76:8000"
 COMPANY_NAME = os.getenv("COMPANY_NAME", "ABC/AMEGA")
 SEND_INVOICE_REQUEST_NO_INFO = False  # Set to True to send directly, False for draft
 SEND_CLAIMS_PAID_NO_PROOF = False     # Set to True to send directly, False for draft
+SEND_INVOICE_WITH_ATTACHMENT = False  # Set to True to send the SECOND invoice email directly, False for draft (only runs if first was sent)
 
 # Updated list of allowed labels
 ALLOWED_LABELS = [
@@ -53,8 +57,14 @@ ALLOWED_LABELS = [
     "uncategorised"
 ]
 # Labels that should receive responses
+# NOTE:
+# - Classification event_type will be "invoice_request_no_info" or "claims_paid_no_proof".
+# - "invoice_request_acknowledgment" is included so ModelAPIClient.generate_reply()
+#   is allowed to call /generate_reply for the ACK template, even though it is
+#   not a classification label returned by the model.
 RESPONSE_LABELS = [
-    "invoice_request_no_info", 
+    "invoice_request_no_info",
+    "invoice_request_acknowledgment",
     "claims_paid_no_proof"
 ]
 
@@ -125,9 +135,10 @@ class ModelAPIClient:
             return self._get_manual_review_fallback()
 
     def generate_reply(self, subject, body, label, sender_name=None, sender_email=None, 
-                       recipient_email=None, entities=None):
-        """Generate reply - 60 second timeout, no reply if timeout."""
+                       recipient_email=None, entities=None, max_retries=3):
+        """Generate reply with retry logic - 60 second timeout per attempt, up to 3 retries."""
         if label not in RESPONSE_LABELS:
+            logger.warning(f"Label {label} not in RESPONSE_LABELS - skipping reply generation")
             return ""
             
         payload = {
@@ -140,37 +151,74 @@ class ModelAPIClient:
             "entities": entities or {}
         }
         
-        try:
-            logger.info(f"Generating reply for {label} (60s timeout)...")
-            start_time = time.time()
-            
-            # Single 60-second timeout for reply generation too
-            response = requests.post(
-                f"{self.base_url}/api/generate_reply", 
-                json=payload, 
-                timeout=60  # 60 seconds max
-            )
-            response.raise_for_status()
-            result = response.json()
-            reply = result.get("reply", "")
-            
-            # Log actual processing time
-            elapsed = time.time() - start_time
-            logger.info(f"Reply generated in {elapsed:.1f}s for {label}: {len(reply)} chars")
-            
-            return reply
-            
-        except requests.exceptions.Timeout:
-            logger.warning(f"Reply generation timeout after 60s - no reply will be generated")
-            return ""
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Reply generation error: {e} - no reply will be generated")
-            return ""
-            
-        except Exception as e:
-            logger.error(f"Unexpected reply error: {e} - no reply will be generated")
-            return ""
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(f"Generating reply for {label} (attempt {attempt}/{max_retries}, 60s timeout)...")
+                start_time = time.time()
+                
+                # Single 60-second timeout for reply generation
+                response = requests.post(
+                    f"{self.base_url}/api/generate_reply", 
+                    json=payload, 
+                    timeout=60  # 60 seconds max
+                )
+                response.raise_for_status()
+                result = response.json()
+                reply = result.get("reply", "")
+                
+                # Log actual processing time
+                elapsed = time.time() - start_time
+                
+                if reply and reply.strip():
+                    logger.info(f"Reply generated successfully in {elapsed:.1f}s for {label}: {len(reply)} chars (attempt {attempt})")
+                    return reply
+                else:
+                    logger.warning(f"Reply generation returned empty reply for {label} (attempt {attempt}/{max_retries})")
+                    if attempt < max_retries:
+                        logger.info(f"Retrying reply generation for {label}...")
+                        time.sleep(2)  # Brief delay before retry
+                        continue
+                    else:
+                        logger.error(f"Reply generation failed after {max_retries} attempts - returned empty reply for {label}")
+                        return ""
+                
+            except requests.exceptions.Timeout:
+                last_error = f"Timeout after 60s"
+                logger.warning(f"Reply generation timeout for {label} (attempt {attempt}/{max_retries})")
+                if attempt < max_retries:
+                    logger.info(f"Retrying reply generation for {label} after timeout...")
+                    time.sleep(2)
+                    continue
+                else:
+                    logger.error(f"Reply generation failed after {max_retries} attempts due to timeout for {label}")
+                    return ""
+                
+            except requests.exceptions.RequestException as e:
+                last_error = str(e)
+                logger.error(f"Reply generation error for {label} (attempt {attempt}/{max_retries}): {e}")
+                if attempt < max_retries:
+                    logger.info(f"Retrying reply generation for {label} after error...")
+                    time.sleep(2)
+                    continue
+                else:
+                    logger.error(f"Reply generation failed after {max_retries} attempts due to request error for {label}: {e}")
+                    return ""
+                
+            except Exception as e:
+                last_error = str(e)
+                logger.error(f"Unexpected reply error for {label} (attempt {attempt}/{max_retries}): {e}")
+                if attempt < max_retries:
+                    logger.info(f"Retrying reply generation for {label} after unexpected error...")
+                    time.sleep(2)
+                    continue
+                else:
+                    logger.error(f"Reply generation failed after {max_retries} attempts due to unexpected error for {label}: {e}")
+                    return ""
+        
+        # Should not reach here, but just in case
+        logger.error(f"Reply generation failed for {label} after {max_retries} attempts. Last error: {last_error}")
+        return ""
 
     def _get_manual_review_fallback(self):
         """Fallback response for failed API calls - sends to manual review."""
@@ -478,10 +526,60 @@ class MSGraphClient:
                     
                     if update_response.status_code in [200, 204]:
                         logger.info(f"Threaded draft body updated successfully")
-                        return draft_id
+                        
+                        # STEP 3: Verify draft actually exists before returning (safety check)
+                        # If verification fails, we still return draft_id since creation succeeded
+                        # This prevents losing drafts due to temporary network/API issues
+                        verify_endpoint = f"{self.base_url}/users/{from_account}/messages/{draft_id}"
+                        try:
+                            verify_response = httpx.get(verify_endpoint, headers=headers, timeout=10)  # Shorter timeout for verification
+                            
+                            if verify_response.status_code == 200:
+                                verify_data = verify_response.json()
+                                if verify_data.get("isDraft", False):
+                                    logger.info(f"Draft verified and exists in mailbox: {draft_id}")
+                                    return draft_id
+                                else:
+                                    logger.warning(f"Draft ID returned but message is not a draft (might have been sent): {draft_id}")
+                                    # Still return draft_id since creation succeeded - let caller decide
+                                    return draft_id
+                            elif verify_response.status_code == 404:
+                                logger.error(f"Draft created but NOT FOUND in Graph API (404) - draft may have been deleted: {draft_id}")
+                                # Draft doesn't exist - return None to prevent storing invalid draft_id
+                                return None
+                            else:
+                                logger.warning(f"Draft created but verification returned {verify_response.status_code} - returning draft_id anyway (may be temporary issue)")
+                                # Return draft_id since creation succeeded - verification failure might be temporary
+                                return draft_id
+                        except httpx.TimeoutException:
+                            logger.warning(f"Draft created but verification timed out - returning draft_id anyway (may be temporary network issue)")
+                            return draft_id
+                        except Exception as verify_error:
+                            logger.warning(f"Draft created but verification failed with error: {verify_error} - returning draft_id anyway")
+                            return draft_id
                     else:
                         logger.warning(f"Draft created but body update failed: {update_response.status_code}")
-                        return draft_id  # Return anyway, as draft was created
+                        # Still verify the draft exists even if update failed
+                        verify_endpoint = f"{self.base_url}/users/{from_account}/messages/{draft_id}"
+                        try:
+                            verify_response = httpx.get(verify_endpoint, headers=headers, timeout=10)
+                            if verify_response.status_code == 200:
+                                verify_data = verify_response.json()
+                                if verify_data.get("isDraft", False):
+                                    logger.warning(f"Draft exists but body update failed - returning draft_id anyway")
+                                    return draft_id
+                                else:
+                                    logger.warning(f"Draft exists but is not a draft (might have been sent) - returning draft_id anyway")
+                                    return draft_id
+                            elif verify_response.status_code == 404:
+                                logger.error(f"Draft created but NOT FOUND in Graph API (404) after body update failed")
+                                return None
+                            else:
+                                logger.warning(f"Draft created but verification returned {verify_response.status_code} - returning draft_id anyway")
+                                return draft_id
+                        except Exception as verify_error:
+                            logger.warning(f"Draft created but verification failed: {verify_error} - returning draft_id anyway")
+                            return draft_id
                 else:
                     logger.error("No draft ID returned from createReply")
             else:
@@ -549,6 +647,25 @@ class MSGraphClient:
                 
         except Exception as e:
             logger.error(f"Error sending threaded reply directly: {e}")
+            return False
+
+    def send_existing_draft(self, draft_id: str, from_account: str) -> bool:
+        """Send an existing draft message (used when attachments were added to a draft)."""
+        access_token = self.get_access_token()
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        try:
+            send_endpoint = f"{self.base_url}/users/{from_account}/messages/{draft_id}/send"
+            send_response = httpx.post(send_endpoint, headers=headers, json={}, timeout=30)
+            if send_response.status_code in [200, 202]:
+                logger.info(f"Existing draft sent: {draft_id}")
+                return True
+            logger.error(f"Failed to send existing draft {draft_id}: {send_response.status_code} - {send_response.text}")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending existing draft {draft_id}: {e}")
             return False
 
     def attach_files_to_draft(self, draft_id: str, from_account: str, file_paths: List[str]) -> int:
@@ -684,6 +801,7 @@ class EmailProcessor:
         self.mongo = get_mongo()
         self.model_api = ModelAPIClient()
         self.graph_client = MSGraphClient()
+        self.invoice_handler = InvoiceHandler()
         self.folder_mappings = {}
         
         # Set batch in MongoDB
@@ -849,6 +967,28 @@ class EmailProcessor:
             logger.info("STOP: Stop signal detected before model API call - stopping NOW")
             return False
         
+        # ✅ Extract and append attachment text for claims_paid classification
+        # This is critical for distinguishing claims_paid_with_proof vs claims_paid_no_proof
+        attachments_processed_count = 0
+        if has_attachments:
+            try:
+                access_token = self.graph_client.get_access_token()
+                attachment_content, attachments_processed_count = get_formatted_attachment_content_for_classification(
+                    message_id=message_id,
+                    email_address=source_account,
+                    access_token=access_token,
+                    base_url=MS_GRAPH_BASE_URL
+                )
+                
+                if attachment_content:
+                    clean_body = clean_body + attachment_content
+                    logger.info(f"Appended attachment text to email body for classification ({attachments_processed_count} attachment(s) processed)")
+                else:
+                    logger.info(f"Attachments detected but no text extracted - classification will use email body only")
+            except Exception as e:
+                logger.warning(f"Error extracting attachment text: {e} - continuing without attachment text")
+                attachments_processed_count = 0
+        
         # ✅ Call model API with enhanced attachment detection
         model_response = self.model_api.process_email_complete(
             subject=subject,
@@ -900,6 +1040,12 @@ class EmailProcessor:
         
         logger.info(f"Model classified email as: {event_type}")
         
+        # ✅ VALIDATION: Check if reply is needed and log if missing
+        if event_type in RESPONSE_LABELS:
+            logger.info(f"Email requires reply (event_type: {event_type} is in RESPONSE_LABELS)")
+        else:
+            logger.info(f"Email does not require reply (event_type: {event_type} not in RESPONSE_LABELS)")
+        
         # Generate threaded reply if needed
         reply_text = ""
         draft_created = False
@@ -913,9 +1059,6 @@ class EmailProcessor:
             if self.stop_event.is_set():
                 logger.info("STOP: Stop signal detected before reply generation - stopping NOW")
                 return False
-            
-            # Map invoice_request_with_info to use invoice_request_no_info reply template
-            reply_label = "invoice_request_no_info" if event_type == "invoice_request_with_info" else event_type
             
             # Build entities dict from model response for better context
             entities = {}
@@ -934,71 +1077,341 @@ class EmailProcessor:
             # Determine recipient_email (where reply will be sent - usually the sender)
             reply_recipient_email = recipient_emails[0] if recipient_emails else sender
             
-            # Generate reply text from model with all available context
-            reply_text = self.model_api.generate_reply(
-                subject=subject,
-                body=clean_body, 
-                label=reply_label,  # Both invoice labels use same template
-                sender_name=sender_name,
-                sender_email=sender,
-                recipient_email=reply_recipient_email,
-                entities=entities
-            )
+            # Initialize invoice_flow_handled flag
+            invoice_flow_handled = False
             
-            # CHECK UNIFIED STOP AFTER REPLY GENERATION
-            if self.stop_event.is_set():
-                logger.info("STOP: Stop signal detected after reply generation - stopping NOW")
-                return False
+            # SPECIAL HANDLING:
+            # invoice_request_no_info can generate TWO replies:
+            # 1) acknowledgment (draft OR send)
+            # 2) main invoice reply (ONLY created if #1 was actually SENT)
+            if event_type == "invoice_request_no_info":
+                invoice_flow_handled = True
+                # STEP 1: Generate FIRST reply text (acknowledgment template)
+                first_reply_text = self.model_api.generate_reply(
+                    subject=subject,
+                    body=clean_body,
+                    label="invoice_request_acknowledgment",
+                    sender_name=sender_name,
+                    sender_email=sender,
+                    recipient_email=reply_recipient_email,
+                    entities=entities
+                )
                 
-            if reply_text:
-                logger.info(f"Reply generated: {len(reply_text)} chars")
+                # CHECK UNIFIED STOP AFTER REPLY GENERATION
+                if self.stop_event.is_set():
+                    logger.info("STOP: Stop signal detected after reply generation - stopping NOW")
+                    return False
                 
-                # FEATURE 2: Check per-response-type sending configuration - ONLY 2 TYPES
-                should_send_directly = False
+                # ✅ VALIDATION: Check if reply was actually generated
+                if not first_reply_text or not first_reply_text.strip():
+                    logger.error(f"❌ CRITICAL: Reply generation FAILED for invoice_request_no_info (acknowledgment) - no reply text generated after retries")
+                    logger.error(f"   Email: {message_id}, Event Type: {event_type}, Label: invoice_request_acknowledgment")
+                    logger.error(f"   This email requires a reply but none was generated - processing will continue without reply")
+                    # Continue processing but without reply
+                    first_reply_text = ""
                 
-                if event_type == "invoice_request_no_info":
-                    should_send_directly = SEND_INVOICE_REQUEST_NO_INFO
-                    logger.info(f"Invoice request (no info) - Send directly: {should_send_directly}")
-                elif event_type == "claims_paid_no_proof":
-                    should_send_directly = SEND_CLAIMS_PAID_NO_PROOF
-                    logger.info(f"Claims paid (no proof) - Send directly: {should_send_directly}")
+                if first_reply_text:
+                    logger.info(f"Invoice ack reply generated: {len(first_reply_text)} chars")
                 
-                if should_send_directly:
-                    # Send email directly using Graph API
-                    try:
-                        success = self.graph_client.send_threaded_reply_directly(
-                            message_id, reply_text, source_account
-                        )
-                        if success:
-                            logger.info(f"Email sent directly for {event_type}")
-                            email_sent_directly = True
-                        else:
-                            logger.warning(f"Direct send failed, creating draft instead")
+                # If we're drafting the first email, DO NOT generate the second email
+                if not SEND_INVOICE_REQUEST_NO_INFO:
+                    reply_text = first_reply_text or ""
+                    if reply_text:
+                        # ✅ RETRY: Try to create draft up to 3 times
+                        draft_id = None
+                        for draft_attempt in range(1, 4):
                             draft_id = self.graph_client.create_threaded_reply_draft(
                                 message_id, reply_text, source_account
                             )
                             if draft_id:
                                 draft_created = True
-                                logger.info(f"Fallback draft created: {draft_id}")
-                    except Exception as e:
-                        logger.error(f"Error sending email directly: {e}, creating draft instead")
-                        draft_id = self.graph_client.create_threaded_reply_draft(
-                            message_id, reply_text, source_account
-                        )
+                                logger.info(f"Invoice ack draft saved successfully (attempt {draft_attempt}/3): {draft_id}")
+                                break
+                            else:
+                                if draft_attempt < 3:
+                                    logger.warning(f"Invoice ack draft creation failed (attempt {draft_attempt}/3) - retrying...")
+                                    time.sleep(2)  # Brief delay before retry
+                                else:
+                                    logger.error(f"❌ CRITICAL: Invoice ack draft creation FAILED after 3 attempts for email {message_id}")
+                                    logger.error(f"   Reply text was generated ({len(reply_text)} chars) but draft could not be created")
+                        
                         if draft_id:
-                            draft_created = True
-                            logger.info(f"Fallback draft created: {draft_id}")
-                else:
-                    # Create draft as usual
-                    draft_id = self.graph_client.create_threaded_reply_draft(
-                        message_id, reply_text, source_account
-                    )
-                    
-                    if draft_id:
-                        logger.info(f"Threaded draft saved: {draft_id}")
-                        draft_created = True
+                            logger.info(f"Invoice ack draft saved (no second email will be created): {draft_id}")
+                        else:
+                            logger.error(f"❌ CRITICAL: Invoice ack draft NOT created after 3 attempts - email {message_id} will be processed without draft")
                     else:
-                        logger.warning(f"Threaded draft save failed")
+                        logger.error(f"❌ CRITICAL: No reply text available to create draft for email {message_id}")
+                    # Stop here (no second email)
+                else:
+                    # Send FIRST email directly
+                    first_sent = False
+                    if first_reply_text:
+                        try:
+                            success = self.graph_client.send_threaded_reply_directly(
+                                message_id, first_reply_text, source_account
+                            )
+                            if success:
+                                first_sent = True
+                                logger.info("Invoice acknowledgment email sent directly")
+                            else:
+                                logger.warning("Invoice ack direct send failed; creating draft and skipping second email")
+                                draft_id = self.graph_client.create_threaded_reply_draft(
+                                    message_id, first_reply_text, source_account
+                                )
+                                if draft_id:
+                                    draft_created = True
+                                    reply_text = first_reply_text
+                                    logger.info(f"Invoice ack fallback draft saved (no second email): {draft_id}")
+                        except Exception as e:
+                            logger.error(f"Error sending invoice ack directly: {e}; creating draft and skipping second email")
+                            draft_id = self.graph_client.create_threaded_reply_draft(
+                                message_id, first_reply_text, source_account
+                            )
+                            if draft_id:
+                                draft_created = True
+                                reply_text = first_reply_text
+                                logger.info(f"Invoice ack fallback draft saved (no second email): {draft_id}")
+                    
+                    # STEP 2: ONLY if first email was SENT, generate SECOND email (main invoice template)
+                    # ✅ WAIT: Ensure first draft was created successfully before proceeding
+                    if first_sent:
+                        # Wait a brief moment to ensure first email is fully processed
+                        time.sleep(1)
+                        
+                        second_reply_text = self.model_api.generate_reply(
+                            subject=subject,
+                            body=clean_body,
+                            label="invoice_request_no_info",
+                            sender_name=sender_name,
+                            sender_email=sender,
+                            recipient_email=reply_recipient_email,
+                            entities=entities
+                        )
+                        
+                        # CHECK UNIFIED STOP AFTER REPLY GENERATION
+                        if self.stop_event.is_set():
+                            logger.info("STOP: Stop signal detected after reply generation - stopping NOW")
+                            return False
+                        
+                        # ✅ VALIDATION: Check if second reply was actually generated
+                        if not second_reply_text or not second_reply_text.strip():
+                            logger.error(f"❌ CRITICAL: Second reply generation FAILED for invoice_request_no_info (main) - no reply text generated after retries")
+                            logger.error(f"   Email: {message_id}, Event Type: {event_type}, Label: invoice_request_no_info")
+                            logger.error(f"   First email was sent, but second reply could not be generated - will not create second draft")
+                            second_reply_text = ""
+                        
+                        if second_reply_text:
+                            logger.info(f"Invoice main reply generated: {len(second_reply_text)} chars")
+                            # Store main reply text in MongoDB (most useful one)
+                            reply_text = second_reply_text
+                            
+                            # Always create the second as a draft first (so we can attach invoice if available)
+                            # ✅ RETRY: Try to create draft up to 3 times
+                            second_draft_id = None
+                            for draft_attempt in range(1, 4):
+                                second_draft_id = self.graph_client.create_threaded_reply_draft(
+                                    message_id, second_reply_text, source_account
+                                )
+                                if second_draft_id:
+                                    draft_created = True
+                                    draft_id = second_draft_id  # Persist latest draft id to MongoDB
+                                    logger.info(f"Invoice main draft created successfully (attempt {draft_attempt}/3): {second_draft_id}")
+                                    break
+                                else:
+                                    if draft_attempt < 3:
+                                        logger.warning(f"Invoice main draft creation failed (attempt {draft_attempt}/3) - retrying...")
+                                        time.sleep(2)  # Brief delay before retry
+                                    else:
+                                        logger.error(f"❌ CRITICAL: Invoice main draft creation FAILED after 3 attempts for email {message_id}")
+                                        logger.error(f"   Reply text was generated ({len(second_reply_text)} chars) but draft could not be created")
+                            
+                            if second_draft_id:
+                                logger.info(f"Invoice main draft created: {second_draft_id}")
+                                
+                                # Try to fetch invoice(s) and attach (non-blocking if fails)
+                                invoice_file_paths: List[str] = []
+                                temp_dir = None
+                                try:
+                                    if company_name and debtor_number:
+                                        fetch_result = self.invoice_handler.fetch_invoices(
+                                            company_name=company_name,
+                                            abcfn_number=debtor_number,
+                                            invoice_number=invoice_number or None
+                                        )
+                                        if fetch_result.success and fetch_result.content and fetch_result.filename:
+                                            temp_dir = tempfile.mkdtemp(prefix="invoice_")
+                                            invoice_path = os.path.join(temp_dir, fetch_result.filename)
+                                            with open(invoice_path, "wb") as f:
+                                                f.write(fetch_result.content)
+                                            invoice_file_paths = [invoice_path]
+                                            logger.info(f"Invoice file prepared for attachment: {fetch_result.filename} ({len(fetch_result.content)} bytes)")
+                                        else:
+                                            logger.info(f"Invoice fetch skipped/failed (non-blocking): {fetch_result.error}")
+                                    else:
+                                        logger.info("Invoice fetch skipped: missing company_name or debtor_number")
+                                    
+                                    if invoice_file_paths:
+                                        attached_count = self.graph_client.attach_files_to_draft(
+                                            second_draft_id,
+                                            from_account=source_account,
+                                            file_paths=invoice_file_paths
+                                        )
+                                        if attached_count > 0:
+                                            invoices_attached = True
+                                            invoice_count = attached_count
+                                            logger.info(f"Attached {attached_count} invoice file(s) to draft {second_draft_id}")
+                                except Exception as e:
+                                    logger.warning(f"Invoice fetch/attach failed (non-blocking): {e}")
+                                finally:
+                                    # cleanup temp files
+                                    try:
+                                        if temp_dir:
+                                            for p in invoice_file_paths:
+                                                try:
+                                                    os.remove(p)
+                                                except Exception:
+                                                    pass
+                                            try:
+                                                os.rmdir(temp_dir)
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+                                
+                                # If configured, send the second draft (with or without attachment)
+                                if SEND_INVOICE_WITH_ATTACHMENT:
+                                    try:
+                                        sent = self.graph_client.send_existing_draft(
+                                            second_draft_id, from_account=source_account
+                                        )
+                                        if sent:
+                                            email_sent_directly = True
+                                            logger.info("Invoice main draft sent (after ack sent)")
+                                        else:
+                                            logger.warning("Failed to send invoice main draft; leaving as draft")
+                                    except Exception as e:
+                                        logger.error(f"Error sending invoice main draft; leaving as draft: {e}")
+                            else:
+                                logger.error(f"❌ CRITICAL: Invoice main draft NOT created after 3 attempts - email {message_id} will be processed without second draft")
+            else:
+                # Default single-reply behavior (e.g. claims_paid_no_proof)
+                # invoice_flow_handled is already False (initialized above)
+                reply_text = self.model_api.generate_reply(
+                    subject=subject,
+                    body=clean_body,
+                    label=event_type,
+                    sender_name=sender_name,
+                    sender_email=sender,
+                    recipient_email=reply_recipient_email,
+                    entities=entities
+                )
+            
+            # CHECK UNIFIED STOP AFTER REPLY GENERATION
+            if self.stop_event.is_set():
+                logger.info("STOP: Stop signal detected after reply generation - stopping NOW")
+                return False
+            
+            # ✅ VALIDATION: Check if reply was actually generated for non-invoice flows
+            if not invoice_flow_handled:
+                if not reply_text or not reply_text.strip():
+                    logger.error(f"❌ CRITICAL: Reply generation FAILED for {event_type} - no reply text generated after retries")
+                    logger.error(f"   Email: {message_id}, Event Type: {event_type}, Label: {event_type}")
+                    logger.error(f"   This email requires a reply but none was generated - processing will continue without reply")
+                    reply_text = ""
+                
+            if reply_text:
+                logger.info(f"Reply generated: {len(reply_text)} chars")
+                
+                # invoice_request_no_info is fully handled above (ack + optional main),
+                # so we MUST NOT run the default send/draft logic again.
+                if event_type == "invoice_request_no_info" and invoice_flow_handled:
+                    pass
+                else:
+                    # FEATURE 2: Check per-response-type sending configuration - ONLY 2 TYPES
+                    should_send_directly = False
+                    
+                    if event_type == "invoice_request_no_info":
+                        should_send_directly = SEND_INVOICE_REQUEST_NO_INFO
+                        logger.info(f"Invoice request (no info) - Send directly: {should_send_directly}")
+                    elif event_type == "claims_paid_no_proof":
+                        should_send_directly = SEND_CLAIMS_PAID_NO_PROOF
+                        logger.info(f"Claims paid (no proof) - Send directly: {should_send_directly}")
+                    
+                    if should_send_directly:
+                        # Send email directly using Graph API
+                        try:
+                            success = self.graph_client.send_threaded_reply_directly(
+                                message_id, reply_text, source_account
+                            )
+                            if success:
+                                logger.info(f"Email sent directly for {event_type}")
+                                email_sent_directly = True
+                            else:
+                                logger.warning(f"Direct send failed, creating draft instead")
+                                # ✅ RETRY: Try to create draft up to 3 times
+                                draft_id = None
+                                for draft_attempt in range(1, 4):
+                                    draft_id = self.graph_client.create_threaded_reply_draft(
+                                        message_id, reply_text, source_account
+                                    )
+                                    if draft_id:
+                                        draft_created = True
+                                        logger.info(f"Fallback draft created successfully (attempt {draft_attempt}/3): {draft_id}")
+                                        break
+                                    else:
+                                        if draft_attempt < 3:
+                                            logger.warning(f"Fallback draft creation failed (attempt {draft_attempt}/3) - retrying...")
+                                            time.sleep(2)
+                                        else:
+                                            logger.error(f"❌ CRITICAL: Fallback draft creation FAILED after 3 attempts for email {message_id}")
+                                
+                                if not draft_id:
+                                    logger.error(f"❌ CRITICAL: Fallback draft NOT created after 3 attempts - email {message_id} will be processed without draft")
+                        except Exception as e:
+                            logger.error(f"Error sending email directly: {e}, creating draft instead")
+                            # ✅ RETRY: Try to create draft up to 3 times
+                            draft_id = None
+                            for draft_attempt in range(1, 4):
+                                draft_id = self.graph_client.create_threaded_reply_draft(
+                                    message_id, reply_text, source_account
+                                )
+                                if draft_id:
+                                    draft_created = True
+                                    logger.info(f"Fallback draft created successfully (attempt {draft_attempt}/3): {draft_id}")
+                                    break
+                                else:
+                                    if draft_attempt < 3:
+                                        logger.warning(f"Fallback draft creation failed (attempt {draft_attempt}/3) - retrying...")
+                                        time.sleep(2)
+                                    else:
+                                        logger.error(f"❌ CRITICAL: Fallback draft creation FAILED after 3 attempts for email {message_id}")
+                            
+                            if not draft_id:
+                                logger.error(f"❌ CRITICAL: Fallback draft NOT created after 3 attempts - email {message_id} will be processed without draft")
+                    else:
+                        # Create draft as usual
+                        # ✅ RETRY: Try to create draft up to 3 times
+                        draft_id = None
+                        for draft_attempt in range(1, 4):
+                            draft_id = self.graph_client.create_threaded_reply_draft(
+                                message_id, reply_text, source_account
+                            )
+                            if draft_id:
+                                draft_created = True
+                                logger.info(f"Threaded draft saved successfully (attempt {draft_attempt}/3): {draft_id}")
+                                break
+                            else:
+                                if draft_attempt < 3:
+                                    logger.warning(f"Draft creation failed (attempt {draft_attempt}/3) - retrying...")
+                                    time.sleep(2)
+                                else:
+                                    logger.error(f"❌ CRITICAL: Draft creation FAILED after 3 attempts for email {message_id}")
+                        
+                        if not draft_id:
+                            logger.error(f"❌ CRITICAL: Draft NOT created after 3 attempts - email {message_id} will be processed without draft")
+                            draft_created = True
+                        else:
+                            logger.warning(f"Threaded draft save failed")
         
         # CHECK UNIFIED STOP BEFORE MONGODB STORAGE
         if self.stop_event.is_set():
@@ -1043,6 +1456,7 @@ class EmailProcessor:
             "draft_id": draft_id,
             "invoices_attached": invoices_attached,
             "invoice_count": invoice_count,
+            "attachments_processed_count": attachments_processed_count,  # Number of attachments successfully processed/extracted
             "batch_id": self.batch_id,
             "data_source": data_source,
             "had_threads": had_threads,
