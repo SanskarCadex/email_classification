@@ -1244,7 +1244,10 @@ class EmailProcessor:
                                         )
                                         if fetch_result.success and fetch_result.content and fetch_result.filename:
                                             temp_dir = tempfile.mkdtemp(prefix="invoice_")
-                                            invoice_path = os.path.join(temp_dir, fetch_result.filename)
+                                            safe_name = os.path.basename(fetch_result.filename)
+                                            if safe_name in ("", ".", ".."):
+                                                safe_name = "invoice_file"
+                                            invoice_path = os.path.join(temp_dir, safe_name)
                                             with open(invoice_path, "wb") as f:
                                                 f.write(fetch_result.content)
                                             invoice_file_paths = [invoice_path]
