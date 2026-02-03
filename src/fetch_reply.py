@@ -997,6 +997,13 @@ class EmailProcessor:
                 attachments_processed_count = 0
         
         # ✅ Call model API with enhanced attachment detection
+        # Log body length and preview for debugging
+        body_length = len(clean_body)
+        body_preview = clean_body[:200] + "..." if len(clean_body) > 200 else clean_body
+        logger.info(f"Sending to model API: body_length={body_length}, has_attachments={has_attachments}, attachments_processed={attachments_processed_count}")
+        if "--- ATTACHMENT CONTENT ---" in clean_body:
+            logger.info("✅ Attachment content included in body for model classification")
+        
         model_response = self.model_api.process_email_complete(
             subject=subject,
             body=clean_body,
