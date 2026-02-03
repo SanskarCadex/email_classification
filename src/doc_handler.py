@@ -67,6 +67,18 @@ class DocumentReader:
         except ImportError:
             self.use_pdfplumber = False
         
+        # Verify Tesseract is actually working, not just imported
+        if self.tesseract_available:
+            try:
+                import pytesseract
+                # Test if tesseract binary is accessible
+                pytesseract.get_tesseract_version()
+                logger.info("Tesseract OCR is available and working")
+            except Exception as e:
+                logger.error(f"Tesseract OCR imported but not working: {e}")
+                logger.error("Please ensure Tesseract OCR is installed: brew install tesseract (macOS) or apt-get install tesseract-ocr (Linux)")
+                self.tesseract_available = False
+        
         if not self.tesseract_available:
             logger.warning("Tesseract OCR not available. Image OCR will be disabled.")
         if not self.pdf_available:
@@ -188,6 +200,10 @@ class DocumentReader:
             logger.warning("pdf2image not available - cannot use OCR fallback for PDFs")
             return ""
         
+        if not self.tesseract_available:
+            logger.warning("Tesseract OCR not available - cannot use OCR fallback for PDFs")
+            return ""
+        
         try:
             # Convert PDF pages to images
             images = convert_from_bytes(pdf_bytes, dpi=300)
@@ -199,17 +215,35 @@ class DocumentReader:
                     if image.mode != 'RGB':
                         image = image.convert('RGB')
                     
-                    # Perform OCR on the image
-                    page_text = pytesseract.image_to_string(image, lang='eng')
-                    if page_text.strip():
-                        text_parts.append(page_text.strip())
+                    # Perform OCR on the image with comprehensive error handling
+                    try:
+                        page_text = pytesseract.image_to_string(image, lang='eng', timeout=30)
+                        if page_text.strip():
+                            text_parts.append(page_text.strip())
+                            logger.info(f"Extracted {len(page_text.strip())} characters from PDF page {page_num + 1} using OCR")
+                    except pytesseract.TesseractNotFoundError as e:
+                        logger.error(f"Tesseract OCR binary not found on PDF page {page_num + 1}: {e}")
+                        logger.error("Installation: brew install tesseract (macOS) or apt-get install tesseract-ocr (Linux)")
+                        continue
+                    except pytesseract.TesseractError as e:
+                        logger.warning(f"Tesseract OCR error on PDF page {page_num + 1}: {e}")
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Unexpected error performing OCR on PDF page {page_num + 1}: {e}")
+                        continue
                 except Exception as e:
-                    logger.warning(f"Error performing OCR on PDF page {page_num}: {e}")
+                    logger.warning(f"Error processing PDF page {page_num + 1} for OCR: {e}")
                     continue
             
-            return "\n\n".join(text_parts)
+            if text_parts:
+                result = "\n\n".join(text_parts)
+                logger.info(f"Successfully extracted text from {len(text_parts)} PDF page(s) using OCR")
+                return result
+            else:
+                logger.warning("No text extracted from PDF pages using OCR")
+                return ""
         except Exception as e:
-            logger.error(f"PDF OCR extraction error: {e}")
+            logger.error(f"PDF OCR extraction error: {e}", exc_info=True)
             return ""
     
     def extract_from_image(self, image_bytes: bytes) -> str:
@@ -234,12 +268,28 @@ class DocumentReader:
             if image.mode != 'RGB':
                 image = image.convert('RGB')
             
-            # Perform OCR
-            text = pytesseract.image_to_string(image, lang='eng')
-            
-            return text.strip()
+            # Perform OCR with comprehensive error handling
+            try:
+                text = pytesseract.image_to_string(image, lang='eng', timeout=30)
+                if text and text.strip():
+                    logger.info(f"Successfully extracted {len(text.strip())} characters from image using OCR")
+                    return text.strip()
+                else:
+                    logger.warning("OCR returned empty text - image may not contain readable text")
+                    return ""
+            except pytesseract.TesseractNotFoundError as e:
+                logger.error(f"Tesseract OCR binary not found. Please install Tesseract OCR: {e}")
+                logger.error("Installation: brew install tesseract (macOS) or apt-get install tesseract-ocr (Linux)")
+                return ""
+            except pytesseract.TesseractError as e:
+                logger.error(f"Tesseract OCR error: {e}")
+                return ""
+            except Exception as e:
+                logger.error(f"Unexpected error during OCR processing: {e}", exc_info=True)
+                return ""
+                
         except Exception as e:
-            logger.error(f"Error extracting text from image: {e}")
+            logger.error(f"Error processing image for OCR: {e}", exc_info=True)
             return ""
     
     def extract_from_text_file(self, text_bytes: bytes, encoding: str = 'utf-8') -> str:
@@ -348,10 +398,22 @@ def extract_text_from_attachment(attachment_data: Dict, access_token: str,
         attachment_url = f"{base_url}/users/{email_address}/messages/{message_id}/attachments/{attachment_id}"
         
         logger.info(f"Downloading attachment: {attachment_name} ({content_type})")
-        response = httpx.get(attachment_url, headers=headers, timeout=60)
-        response.raise_for_status()
+        try:
+            response = httpx.get(attachment_url, headers=headers, timeout=60)
+            response.raise_for_status()
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error downloading attachment {attachment_name}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error downloading attachment {attachment_name}: {e}", exc_info=True)
+            return None
         
-        attachment_info = response.json()
+        try:
+            attachment_info = response.json()
+        except Exception as e:
+            logger.error(f"Error parsing attachment JSON response for {attachment_name}: {e}")
+            return None
+        
         content_bytes_b64 = attachment_info.get("contentBytes", "")
 
         # Guardrail: prevent memory spikes for large attachments before base64 decode
@@ -374,22 +436,28 @@ def extract_text_from_attachment(attachment_data: Dict, access_token: str,
         try:
             file_bytes = base64.b64decode(content_bytes_b64)
         except Exception as e:
-            logger.error(f"Error decoding base64 attachment content: {e}")
+            logger.error(f"Error decoding base64 attachment content for {attachment_name}: {e}")
             return None
         
-        # Extract text using DocumentReader
-        reader = DocumentReader()
-        extracted_text = reader.extract_text(file_bytes, content_type, attachment_name)
-        
-        if extracted_text:
-            logger.info(f"Successfully extracted {len(extracted_text)} characters from {attachment_name}")
-        else:
-            logger.warning(f"No text extracted from {attachment_name}")
-        
-        return extracted_text
+        # Extract text using DocumentReader with comprehensive error handling
+        try:
+            reader = DocumentReader()
+            extracted_text = reader.extract_text(file_bytes, content_type, attachment_name)
+            
+            if extracted_text:
+                logger.info(f"Successfully extracted {len(extracted_text)} characters from {attachment_name}")
+            else:
+                logger.warning(f"No text extracted from {attachment_name} - this is normal for images without text or corrupted files")
+            
+            return extracted_text
+        except Exception as e:
+            logger.error(f"CRITICAL: Error extracting text from attachment {attachment_name}: {e}", exc_info=True)
+            logger.error("Continuing with email processing despite attachment extraction failure")
+            return None
         
     except Exception as e:
-        logger.error(f"Error processing attachment {attachment_name}: {e}")
+        logger.error(f"CRITICAL: Unexpected error processing attachment {attachment_name}: {e}", exc_info=True)
+        logger.error("Continuing with email processing despite attachment processing failure")
         return None
 
 
