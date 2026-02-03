@@ -136,7 +136,8 @@ class DocumentReader:
                     logger.info(f"Successfully extracted {len(best_text)} characters using OCR")
                     return best_text
             except Exception as e:
-                logger.warning(f"OCR fallback failed: {e}")
+                logger.error(f"CRITICAL: OCR fallback failed: {e}", exc_info=True)
+                logger.warning("Continuing with available text extraction (if any)")
         
         # Return whatever best text we got (even if minimal)
         if best_text:
@@ -205,8 +206,25 @@ class DocumentReader:
             return ""
         
         try:
-            # Convert PDF pages to images
-            images = convert_from_bytes(pdf_bytes, dpi=300)
+            # Convert PDF pages to images with comprehensive error handling
+            # pdf2image requires poppler-utils to be installed
+            try:
+                images = convert_from_bytes(pdf_bytes, dpi=200)  # Lower DPI to reduce memory usage
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "poppler" in error_msg or "pdftoppm" in error_msg:
+                    logger.error(f"CRITICAL: poppler-utils not installed or not in PATH: {e}")
+                    logger.error("Installation required: brew install poppler (macOS) or apt-get install poppler-utils (Linux)")
+                elif "memory" in error_msg or "too large" in error_msg:
+                    logger.warning(f"PDF too large for OCR conversion: {e}")
+                else:
+                    logger.error(f"Error converting PDF to images: {e}", exc_info=True)
+                return ""
+            
+            if not images:
+                logger.warning("No images generated from PDF - PDF may be corrupted or empty")
+                return ""
+            
             text_parts = []
             
             for page_num, image in enumerate(images):
@@ -243,7 +261,8 @@ class DocumentReader:
                 logger.warning("No text extracted from PDF pages using OCR")
                 return ""
         except Exception as e:
-            logger.error(f"PDF OCR extraction error: {e}", exc_info=True)
+            logger.error(f"CRITICAL: PDF OCR extraction error: {e}", exc_info=True)
+            logger.error("Continuing email processing despite PDF OCR failure")
             return ""
     
     def extract_from_image(self, image_bytes: bytes) -> str:
