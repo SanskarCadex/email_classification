@@ -123,7 +123,7 @@ class ModelAPIClient:
             return result
             
         except requests.exceptions.Timeout:
-            logger.warning(f"Model API timeout after 60s - classifying as manual_review")
+            logger.warning("Model API timeout after 60s - classifying as manual_review")
             return self._get_manual_review_fallback()
             
         except requests.exceptions.RequestException as e:
@@ -525,7 +525,7 @@ class MSGraphClient:
                     update_response = httpx.patch(update_endpoint, headers=headers, json=update_payload, timeout=30)
                     
                     if update_response.status_code in [200, 204]:
-                        logger.info(f"Threaded draft body updated successfully")
+                        logger.info("Threaded draft body updated successfully")
                         
                         # STEP 3: Verify draft actually exists before returning (safety check)
                         # If verification fails, we still return draft_id since creation succeeded
@@ -552,7 +552,7 @@ class MSGraphClient:
                                 # Return draft_id since creation succeeded - verification failure might be temporary
                                 return draft_id
                         except httpx.TimeoutException:
-                            logger.warning(f"Draft created but verification timed out - returning draft_id anyway (may be temporary network issue)")
+                            logger.warning("Draft created but verification timed out - returning draft_id anyway (may be temporary network issue)")
                             return draft_id
                         except Exception as verify_error:
                             logger.warning(f"Draft created but verification failed with error: {verify_error} - returning draft_id anyway")
@@ -566,13 +566,13 @@ class MSGraphClient:
                             if verify_response.status_code == 200:
                                 verify_data = verify_response.json()
                                 if verify_data.get("isDraft", False):
-                                    logger.warning(f"Draft exists but body update failed - returning draft_id anyway")
+                                    logger.warning("Draft exists but body update failed - returning draft_id anyway")
                                     return draft_id
                                 else:
-                                    logger.warning(f"Draft exists but is not a draft (might have been sent) - returning draft_id anyway")
+                                    logger.warning("Draft exists but is not a draft (might have been sent) - returning draft_id anyway")
                                     return draft_id
                             elif verify_response.status_code == 404:
-                                logger.error(f"Draft created but NOT FOUND in Graph API (404) after body update failed")
+                                logger.error("Draft created but NOT FOUND in Graph API (404) after body update failed")
                                 return None
                             else:
                                 logger.warning(f"Draft created but verification returned {verify_response.status_code} - returning draft_id anyway")
@@ -984,7 +984,7 @@ class EmailProcessor:
                     clean_body = clean_body + attachment_content
                     logger.info(f"Appended attachment text to email body for classification ({attachments_processed_count} attachment(s) processed)")
                 else:
-                    logger.info(f"Attachments detected but no text extracted - classification will use email body only")
+                    logger.info("Attachments detected but no text extracted - classification will use email body only")
             except Exception as e:
                 logger.warning(f"Error extracting attachment text: {e} - continuing without attachment text")
                 attachments_processed_count = 0
@@ -1104,9 +1104,9 @@ class EmailProcessor:
                 
                 # ✅ VALIDATION: Check if reply was actually generated
                 if not first_reply_text or not first_reply_text.strip():
-                    logger.error(f"❌ CRITICAL: Reply generation FAILED for invoice_request_no_info (acknowledgment) - no reply text generated after retries")
+                    logger.error("❌ CRITICAL: Reply generation FAILED for invoice_request_no_info (acknowledgment) - no reply text generated after retries")
                     logger.error(f"   Email: {message_id}, Event Type: {event_type}, Label: invoice_request_acknowledgment")
-                    logger.error(f"   This email requires a reply but none was generated - processing will continue without reply")
+                    logger.error("   This email requires a reply but none was generated - processing will continue without reply")
                     # Continue processing but without reply
                     first_reply_text = ""
                 
@@ -1152,6 +1152,10 @@ class EmailProcessor:
                             )
                             if success:
                                 first_sent = True
+                                # Persist ACK as the response when sent directly,
+                                # even if second reply generation fails later.
+                                email_sent_directly = True
+                                reply_text = first_reply_text or ""
                                 logger.info("Invoice acknowledgment email sent directly")
                             else:
                                 logger.warning("Invoice ack direct send failed; creating draft and skipping second email")
@@ -1195,9 +1199,9 @@ class EmailProcessor:
                         
                         # ✅ VALIDATION: Check if second reply was actually generated
                         if not second_reply_text or not second_reply_text.strip():
-                            logger.error(f"❌ CRITICAL: Second reply generation FAILED for invoice_request_no_info (main) - no reply text generated after retries")
+                            logger.error("❌ CRITICAL: Second reply generation FAILED for invoice_request_no_info (main) - no reply text generated after retries")
                             logger.error(f"   Email: {message_id}, Event Type: {event_type}, Label: invoice_request_no_info")
-                            logger.error(f"   First email was sent, but second reply could not be generated - will not create second draft")
+                            logger.error("   First email was sent, but second reply could not be generated - will not create second draft")
                             second_reply_text = ""
                         
                         if second_reply_text:
@@ -1316,7 +1320,7 @@ class EmailProcessor:
                 if not reply_text or not reply_text.strip():
                     logger.error(f"❌ CRITICAL: Reply generation FAILED for {event_type} - no reply text generated after retries")
                     logger.error(f"   Email: {message_id}, Event Type: {event_type}, Label: {event_type}")
-                    logger.error(f"   This email requires a reply but none was generated - processing will continue without reply")
+                    logger.error("   This email requires a reply but none was generated - processing will continue without reply")
                     reply_text = ""
                 
             if reply_text:
@@ -1347,7 +1351,7 @@ class EmailProcessor:
                                 logger.info(f"Email sent directly for {event_type}")
                                 email_sent_directly = True
                             else:
-                                logger.warning(f"Direct send failed, creating draft instead")
+                                logger.warning("Direct send failed, creating draft instead")
                                 # ✅ RETRY: Try to create draft up to 3 times
                                 draft_id = None
                                 for draft_attempt in range(1, 4):
@@ -1949,7 +1953,7 @@ def fetch_misclassification_count(misclassification_mailbox, start_date_utc, end
         
         folder_emails_url = f"{MS_GRAPH_BASE_URL}/users/{misclassification_mailbox}/mailFolders/{ai_agent_folder_id}/messages"
         
-        logger.info(f"Fetching emails from 'AI Agent Issues' folder")
+        logger.info("Fetching emails from 'AI Agent Issues' folder")
         logger.info(f"Time range: {start_iso} to {end_iso}")
         
         response = httpx.get(folder_emails_url, headers=headers, params=params, timeout=60)

@@ -346,6 +346,17 @@ def extract_text_from_attachment(attachment_data: Dict, access_token: str,
         
         attachment_info = response.json()
         content_bytes_b64 = attachment_info.get("contentBytes", "")
+
+        # Guardrail: prevent memory spikes for large attachments before base64 decode
+        # Graph attachment payload includes "size" (bytes)
+        max_bytes = int(os.getenv("MAX_ATTACHMENT_BYTES", "5242880"))  # 5MB default
+        size = attachment_info.get("size")
+        if isinstance(size, int) and size > max_bytes:
+            logger.warning(
+                f"Attachment too large to decode ({size} bytes > {max_bytes}). "
+                f"Skipping: {attachment_name} (attachment_id={attachment_id})"
+            )
+            return None
         
         if not content_bytes_b64:
             logger.warning(f"No content bytes found in attachment: {attachment_name}")
