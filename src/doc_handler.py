@@ -349,7 +349,8 @@ def extract_text_from_attachment(attachment_data: Dict, access_token: str,
 
         # Guardrail: prevent memory spikes for large attachments before base64 decode
         # Graph attachment payload includes "size" (bytes)
-        max_bytes = int(os.getenv("MAX_ATTACHMENT_BYTES", "5242880"))  # 5MB default
+        # NOTE: Hardcoded to 5 MB so production does not depend on .env config.
+        max_bytes = 5 * 1024 * 1024  # 5 MB
         size = attachment_info.get("size")
         if isinstance(size, int) and size > max_bytes:
             logger.warning(
@@ -476,11 +477,43 @@ def get_formatted_attachment_content_for_classification(message_id: str, email_a
         
         # Format attachment content with exact marker format (classifier expects this)
         attachment_content = "\n\n--- ATTACHMENT CONTENT ---\n\n"
+        # Guardrails: prevent unbounded text from attachments (hardcoded limits)
+        # NOTE: These are intentionally hardcoded so production does not depend on .env.
+        max_total_chars = 20000
+        max_per_attachment_chars = 10000
         total_chars = 0
         processed_count = 0
         
         for attachment_name, extracted_text in attachment_texts.items():
             if extracted_text:
+                original_len = len(extracted_text)
+                # Per-attachment cap
+                if original_len > max_per_attachment_chars:
+                    extracted_text = extracted_text[:max_per_attachment_chars] + "\n...[truncated]"
+                    logger.info(
+                        f"Attachment text truncated for {attachment_name}: "
+                        f"{original_len} -> {len(extracted_text)} characters"
+                    )
+                # Global cap
+                if total_chars + len(extracted_text) > max_total_chars:
+                    remaining = max_total_chars - total_chars
+                    if remaining <= 0:
+                        logger.warning(
+                            f"Total attachment text limit reached ({max_total_chars} chars) "
+                            f"while processing {attachment_name}; remaining attachments skipped"
+                        )
+                        break
+                    # Truncate to remaining budget
+                    truncated_text = extracted_text[:remaining] + "\n...[truncated]"
+                    attachment_content += f"--- Content from {attachment_name} ---\n{truncated_text}\n\n"
+                    total_chars += len(truncated_text)
+                    processed_count += 1
+                    logger.warning(
+                        f"Total attachment text truncated at {max_total_chars} chars "
+                        f"while processing {attachment_name}; remaining attachments skipped"
+                    )
+                    break
+
                 attachment_content += f"--- Content from {attachment_name} ---\n{extracted_text}\n\n"
                 total_chars += len(extracted_text)
                 processed_count += 1

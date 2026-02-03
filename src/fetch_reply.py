@@ -123,7 +123,8 @@ class ModelAPIClient:
             return result
             
         except requests.exceptions.Timeout:
-            logger.warning("Model API timeout after 60s - classifying as manual_review")
+            # This call uses a 180s timeout above; reflect that in logs.
+            logger.warning("Model API timeout after 180s - classifying as manual_review")
             return self._get_manual_review_fallback()
             
         except requests.exceptions.RequestException as e:
@@ -184,7 +185,7 @@ class ModelAPIClient:
                         return ""
                 
             except requests.exceptions.Timeout:
-                last_error = f"Timeout after 60s"
+                last_error = "Timeout after 60s"
                 logger.warning(f"Reply generation timeout for {label} (attempt {attempt}/{max_retries})")
                 if attempt < max_retries:
                     logger.info(f"Retrying reply generation for {label} after timeout...")
