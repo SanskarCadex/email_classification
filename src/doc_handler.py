@@ -87,42 +87,49 @@ class DocumentReader:
             logger.warning("PDF extraction not available - install PyPDF2 or pdfplumber")
             return ""
         
-        extracted_text = ""
+        # Track the best non-empty extraction across all methods
+        best_text = ""
         
         # Method 1: Try pdfplumber first (most accurate)
         if self.use_pdfplumber:
             try:
-                extracted_text = self._extract_with_pdfplumber(pdf_bytes)
-                if extracted_text and len(extracted_text.strip()) > 50:
-                    logger.info(f"Successfully extracted {len(extracted_text)} characters using pdfplumber")
-                    return extracted_text
+                candidate_text = self._extract_with_pdfplumber(pdf_bytes)
+                if candidate_text and len(candidate_text.strip()) > len(best_text.strip()):
+                    best_text = candidate_text
+                if best_text and len(best_text.strip()) > 50:
+                    logger.info(f"Successfully extracted {len(best_text)} characters using pdfplumber")
+                    return best_text
             except Exception as e:
                 logger.warning(f"pdfplumber extraction failed: {e}")
         
         # Method 2: Try PyPDF2
         try:
-            extracted_text = self._extract_with_pypdf2(pdf_bytes)
-            if extracted_text and len(extracted_text.strip()) > 50:
-                logger.info(f"Successfully extracted {len(extracted_text)} characters using PyPDF2")
-                return extracted_text
+            candidate_text = self._extract_with_pypdf2(pdf_bytes)
+            if candidate_text and len(candidate_text.strip()) > len(best_text.strip()):
+                best_text = candidate_text
+            if best_text and len(best_text.strip()) > 50:
+                logger.info(f"Successfully extracted {len(best_text)} characters using PyPDF2")
+                return best_text
         except Exception as e:
             logger.warning(f"PyPDF2 extraction failed: {e}")
         
         # Method 3: OCR fallback - convert PDF pages to images and use OCR
-        if self.tesseract_available and (not extracted_text or len(extracted_text.strip()) < 50):
+        if self.tesseract_available and (not best_text or len(best_text.strip()) < 50):
             try:
                 logger.info("Text extraction failed or minimal - trying OCR fallback on PDF pages")
-                extracted_text = self._extract_pdf_with_ocr(pdf_bytes)
-                if extracted_text and len(extracted_text.strip()) > 50:
-                    logger.info(f"Successfully extracted {len(extracted_text)} characters using OCR")
-                    return extracted_text
+                candidate_text = self._extract_pdf_with_ocr(pdf_bytes)
+                if candidate_text and len(candidate_text.strip()) > len(best_text.strip()):
+                    best_text = candidate_text
+                if best_text and len(best_text.strip()) > 50:
+                    logger.info(f"Successfully extracted {len(best_text)} characters using OCR")
+                    return best_text
             except Exception as e:
                 logger.warning(f"OCR fallback failed: {e}")
         
-        # Return whatever we got (even if minimal)
-        if extracted_text:
-            logger.warning(f"Only extracted {len(extracted_text)} characters from PDF - may need manual review")
-            return extracted_text
+        # Return whatever best text we got (even if minimal)
+        if best_text:
+            logger.warning(f"Only extracted {len(best_text)} characters from PDF - may need manual review")
+            return best_text
         
         logger.error("Failed to extract any text from PDF using all methods")
         return ""
@@ -423,12 +430,17 @@ def extract_text_from_all_attachments(message_id: str, email_address: str,
         # Extract text from each attachment
         for attachment in attachments:
             attachment_name = attachment.get("name", "unknown")
+            attachment_id = attachment.get("id", "")
             extracted_text = extract_text_from_attachment(
                 attachment, access_token, message_id, email_address, base_url
             )
             
             if extracted_text:
-                results[attachment_name] = extracted_text
+                key = attachment_name
+                # Avoid overwriting when multiple attachments share the same name
+                if key in results and attachment_id:
+                    key = f"{attachment_name} ({attachment_id})"
+                results[key] = extracted_text
         
         return results
         
