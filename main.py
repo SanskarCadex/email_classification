@@ -75,13 +75,31 @@ logger.addHandler(log_capture)
 # UNIFIED SIGNAL HANDLING - Wrapper function
 def run_email_processor_wrapper():
     """Wrapper to pass stop_event to email processor - ISSUE #6 FIX"""
-    from loop import run_email_processor
-    run_email_processor(stop_event)
+    global processor_running
+    try:
+        from loop import run_email_processor
+        logger.info("Starting email processor thread...")
+        run_email_processor(stop_event)
+        logger.info("Email processor thread completed normally")
+    except Exception as e:
+        logger.exception(f"CRITICAL: Email processor thread crashed with exception: {e}")
+        processor_running = False
+    finally:
+        processor_running = False
+        logger.warning("Email processor thread has stopped - processor_running set to False")
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint for Docker - NO AUTH REQUIRED"""
-    return jsonify({"status": "healthy", "processor_running": processor_running}), 200
+    # Check if thread is actually alive
+    thread_alive = processor_thread is not None and processor_thread.is_alive() if processor_thread else False
+    actual_status = processor_running and thread_alive
+    return jsonify({
+        "status": "healthy", 
+        "processor_running": processor_running,
+        "thread_alive": thread_alive,
+        "actual_status": actual_status
+    }), 200
 
 @app.route('/start', methods=['POST'])
 @require_api_key  # SECURITY: Requires API key
@@ -97,12 +115,23 @@ def start_processor():
         processor_thread = Thread(target=run_email_processor_wrapper)  # Use wrapper
         processor_thread.daemon = True
         processor_thread.start()
-        processor_running = True
         
+        # Give thread a moment to start and catch immediate failures
+        import time
+        time.sleep(0.5)
+        
+        # Check if thread is still alive after starting
+        if not processor_thread.is_alive():
+            processor_running = False
+            logger.error("Processor thread died immediately after start - check logs for errors")
+            return jsonify({"success": False, "message": "Processor thread failed to start - check logs"}), 500
+        
+        processor_running = True
         logger.info("Email processor started via API with unified signal handling")
         return jsonify({"success": True, "message": "Email processor started"})
     except Exception as e:
-        logger.error(f"Failed to start processor: {e}")
+        logger.error(f"Failed to start processor: {e}", exc_info=True)
+        processor_running = False
         return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/stop', methods=['POST'])
@@ -169,13 +198,13 @@ def log_startup_config():
     except ImportError as e:
         logger.warning(f"Could not import sending config: {e}")
     
-    # Log key settings
+    
     logger.info("System Settings:")
     logger.info(f"- SFTP_ENABLED: {os.getenv('SFTP_ENABLED', 'False')}")
     logger.info(f"- BATCH_SIZE: {os.getenv('BATCH_SIZE', '50')} (from env)")
     logger.info(f"- BATCH_INTERVAL: 60 minutes (hardcoded)")
     
-    # SECURITY: Log API key status
+   
     if API_KEY == "default-secret-key-change-me":
         logger.warning("⚠️  Using default API key - CHANGE THIS IN PRODUCTION!")
     else:

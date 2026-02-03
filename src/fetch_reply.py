@@ -123,7 +123,8 @@ class ModelAPIClient:
             return result
             
         except requests.exceptions.Timeout:
-            logger.warning("Model API timeout after 60s - classifying as manual_review")
+            # This call uses a 180s timeout above; reflect that in logs.
+            logger.warning("Model API timeout after 180s - classifying as manual_review")
             return self._get_manual_review_fallback()
             
         except requests.exceptions.RequestException as e:
@@ -184,7 +185,7 @@ class ModelAPIClient:
                         return ""
                 
             except requests.exceptions.Timeout:
-                last_error = f"Timeout after 60s"
+                last_error = "Timeout after 60s"
                 logger.warning(f"Reply generation timeout for {label} (attempt {attempt}/{max_retries})")
                 if attempt < max_retries:
                     logger.info(f"Retrying reply generation for {label} after timeout...")
@@ -1244,7 +1245,10 @@ class EmailProcessor:
                                         )
                                         if fetch_result.success and fetch_result.content and fetch_result.filename:
                                             temp_dir = tempfile.mkdtemp(prefix="invoice_")
-                                            invoice_path = os.path.join(temp_dir, fetch_result.filename)
+                                            safe_name = os.path.basename(fetch_result.filename)
+                                            if safe_name in ("", ".", ".."):
+                                                safe_name = "invoice_file"
+                                            invoice_path = os.path.join(temp_dir, safe_name)
                                             with open(invoice_path, "wb") as f:
                                                 f.write(fetch_result.content)
                                             invoice_file_paths = [invoice_path]
@@ -1497,59 +1501,76 @@ class EmailProcessor:
             
     def process_batch(self, batch_size):
         """Process a batch of emails - handle ANY number of emails like test code."""
-        # Setup folders for all accounts
-        logger.info("Setting up classification folders...")
-        for email_address in self.graph_client.email_addresses:
-            folder_mapping = self.graph_client.ensure_classification_folders(email_address)
-            if folder_mapping:
-                self.folder_mappings[email_address] = folder_mapping
-        
-        if not self.folder_mappings:
-            logger.error("Could not create folder mappings")
-            return False, 0, 0
-        
-        # Fetch emails
-        logger.info(f"Fetching up to {batch_size} emails...")
-        emails = self.graph_client.fetch_unread_emails(batch_size)
-        
-        if not emails:
-            logger.info("No emails to process - this is normal, not an error")
-            # STILL sync to PostgreSQL even with 0 emails (batch tracking)
-            if self.mongo:
-                synced = self.mongo.sync_batch_emails_to_postgres(self.batch_id)
-                logger.info(f"Synced {synced} emails to PostgreSQL")
-            return True, 0, 0  # Success with 0 emails processed
-        
-        # Process whatever emails we have (1, 5, 30, 120 - doesn't matter)
-        processed = 0
-        failed = 0
-        
-        logger.info(f"Processing {len(emails)} emails...")
-        
-        for email in emails:
-            # CHECK UNIFIED STOP BEFORE PROCESSING EACH EMAIL IN BATCH
-            if self.stop_event.is_set():
-                logger.info("STOP: Stop signal detected during batch processing - stopping NOW")
-                break
-                
+        try:
+            # Setup folders for all accounts
+            logger.info("Setting up classification folders...")
+            for email_address in self.graph_client.email_addresses:
+                try:
+                    folder_mapping = self.graph_client.ensure_classification_folders(email_address)
+                    if folder_mapping:
+                        self.folder_mappings[email_address] = folder_mapping
+                except Exception as e:
+                    logger.error(f"Failed to setup folders for {email_address}: {e}", exc_info=True)
+            
+            if not self.folder_mappings:
+                logger.error("Could not create folder mappings for any account")
+                return False, 0, 0
+            
+            # Fetch emails
+            logger.info(f"Fetching up to {batch_size} emails...")
             try:
-                if self._process_single_email(email):
-                    processed += 1
-                else:
-                    failed += 1
+                emails = self.graph_client.fetch_unread_emails(batch_size)
             except Exception as e:
-                logger.error(f"Error processing email {email.get('id', 'unknown')}: {e}")
-                failed += 1
-                # CONTINUE PROCESSING OTHER EMAILS - like test code
-                continue
-        
-        # ALWAYS sync to PostgreSQL (whether we have 1 email or 100)
-        if self.mongo:
-            synced = self.mongo.sync_batch_emails_to_postgres(self.batch_id)
-            logger.info(f"Synced {synced} emails to PostgreSQL")
-        
-        logger.info(f"Batch {self.batch_id} complete: {processed} processed, {failed} failed")
-        return True, processed, failed
+                logger.error(f"Failed to fetch emails: {e}", exc_info=True)
+                return False, 0, 0
+            
+            if not emails:
+                logger.info("No emails to process - this is normal, not an error")
+                # STILL sync to PostgreSQL even with 0 emails (batch tracking)
+                if self.mongo:
+                    try:
+                        synced = self.mongo.sync_batch_emails_to_postgres(self.batch_id)
+                        logger.info(f"Synced {synced} emails to PostgreSQL")
+                    except Exception as e:
+                        logger.error(f"Failed to sync to PostgreSQL: {e}", exc_info=True)
+                return True, 0, 0  # Success with 0 emails processed
+            
+            # Process whatever emails we have (1, 5, 30, 120 - doesn't matter)
+            processed = 0
+            failed = 0
+            
+            logger.info(f"Processing {len(emails)} emails...")
+            
+            for email in emails:
+                # CHECK UNIFIED STOP BEFORE PROCESSING EACH EMAIL IN BATCH
+                if self.stop_event.is_set():
+                    logger.info("STOP: Stop signal detected during batch processing - stopping NOW")
+                    break
+                    
+                try:
+                    if self._process_single_email(email):
+                        processed += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    logger.error(f"Error processing email {email.get('id', 'unknown')}: {e}", exc_info=True)
+                    failed += 1
+                    # CONTINUE PROCESSING OTHER EMAILS - like test code
+                    continue
+            
+            # ALWAYS sync to PostgreSQL (whether we have 1 email or 100)
+            if self.mongo:
+                try:
+                    synced = self.mongo.sync_batch_emails_to_postgres(self.batch_id)
+                    logger.info(f"Synced {synced} emails to PostgreSQL")
+                except Exception as e:
+                    logger.error(f"Failed to sync to PostgreSQL: {e}", exc_info=True)
+            
+            logger.info(f"Batch {self.batch_id} complete: {processed} processed, {failed} failed")
+            return True, processed, failed
+        except Exception as e:
+            logger.exception(f"CRITICAL: process_batch failed with unhandled exception: {e}")
+            return False, 0, 0
 
 def process_unread_emails(batch_id, batch_size=30, stop_event=None):
     """Process unread emails with UNIFIED stop signal."""

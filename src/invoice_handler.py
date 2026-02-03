@@ -252,6 +252,13 @@ class InvoiceHandler:
             Returns PDF (single invoice) or ZIP (multiple matches),
             depending on what the VM returns.
         """
+        # Redacted view of identifiers for safe logging / error payloads
+        redacted_base = {
+            "company_name": "***" if company_name else None,
+            "abcfn_number": "***" if abcfn_number else None,
+            "invoice_number": "***" if invoice_number else None,
+        }
+
         # Global kill switch: check hardcoded flag first, then env flag
         # When disabled, we do NOT call the VM and simply return a disabled result.
         if not HANDLER_ACTIVE:
@@ -274,9 +281,7 @@ class InvoiceHandler:
                 success=False,
                 error=error_msg,
                 request_payload={
-                    "company_name": company_name,
-                    "abcfn_number": abcfn_number,
-                    "invoice_number": invoice_number,
+                    **redacted_base,
                 },
             )
 
@@ -287,10 +292,16 @@ class InvoiceHandler:
             )
 
         payload = self._build_payload(company_name, abcfn_number, invoice_number)
+        redacted_payload = {
+            **payload,
+            "company_name": "***" if payload.get("company_name") else None,
+            "abcfn_number": "***" if payload.get("abcfn_number") else None,
+            "invoice_number": "***" if payload.get("invoice_number") else None,
+        }
 
         logger.info(
             "Calling invoice VM API",
-            extra={"url": self.base_url, "payload": payload},
+            extra={"url": self.base_url, "payload": redacted_payload},
         )
 
         try:
@@ -305,7 +316,7 @@ class InvoiceHandler:
                 success=False,
                 error="VM invoice API unreachable",
                 details=str(e),
-                request_payload=payload,
+                request_payload=redacted_payload,
             )
 
         content_type = resp.headers.get("Content-Type", "")
@@ -333,7 +344,7 @@ class InvoiceHandler:
                 logger.warning("    - Company folder not found in CSV or filesystem")
                 logger.warning("    - ABCFN folder not found (tried with/without underscore)")
                 logger.warning("    - Invoices folder not found inside ABCFN folder")
-                logger.warning(f"  Requested: company='{company_name}', abcfn='{abcfn_number}'")
+                logger.warning("  Requested: company='***', abcfn='***'")
             elif resp.status_code == 503:
                 logger.warning("  VDI service is unreachable (connection error)")
             elif resp.status_code == 504:
@@ -343,7 +354,7 @@ class InvoiceHandler:
                 success=False,
                 error=error_msg,
                 details=data,
-                request_payload=payload,
+                request_payload=redacted_payload,
                 status_code=resp.status_code,
             )
 
@@ -361,7 +372,7 @@ class InvoiceHandler:
                 success=False,
                 error=f"Invoice VM API returned status {resp.status_code}",
                 details=resp.text[:500],
-                request_payload=payload,
+                request_payload=redacted_payload,
                 status_code=resp.status_code,
             )
 
@@ -389,7 +400,7 @@ class InvoiceHandler:
                 return InvoiceFetchResult(
                     success=False,
                     error=f"Failed to decrypt invoice ZIP: {str(e)}",
-                    request_payload=payload,
+                    request_payload=redacted_payload,
                     status_code=resp.status_code,
                 )
 
@@ -447,11 +458,11 @@ class InvoiceHandler:
             filename=filename,
             mime_type=content_type or "application/octet-stream",
             content=file_bytes,
-            request_payload=payload,
+            request_payload=redacted_payload,
             status_code=resp.status_code,
         )
 
 
-__all__ = ["InvoiceHandler", "InvoiceFetchResult"]
+__all__ = ["InvoiceFetchResult", "InvoiceHandler"]
 
 
