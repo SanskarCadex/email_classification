@@ -265,7 +265,7 @@ class DocumentReader:
             logger.error(f"Error extracting text from text file: {e}")
             return ""
     
-    def extract_text(self, file_bytes: bytes, content_type: str, filename: str = None) -> str:
+    def extract_text(self, file_bytes: bytes, content_type: str, filename: Optional[str] = None) -> str:
         """
         Extract text from file based on content type.
         
