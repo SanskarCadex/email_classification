@@ -986,8 +986,14 @@ class EmailProcessor:
                     logger.info(f"Appended attachment text to email body for classification ({attachments_processed_count} attachment(s) processed)")
                 else:
                     logger.info("Attachments detected but no text extracted - classification will use email body only")
+            except ImportError as e:
+                logger.error(f"CRITICAL: Missing dependency for attachment processing: {e}")
+                logger.error("Please ensure pytesseract, pdfplumber, or PyPDF2 are installed")
+                logger.warning("Continuing email processing without attachment text")
+                attachments_processed_count = 0
             except Exception as e:
-                logger.warning(f"Error extracting attachment text: {e} - continuing without attachment text")
+                logger.error(f"CRITICAL: Error extracting attachment text for email {message_id}: {e}", exc_info=True)
+                logger.warning("Continuing email processing without attachment text - this email will be classified using body only")
                 attachments_processed_count = 0
         
         # ✅ Call model API with enhanced attachment detection
