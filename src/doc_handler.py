@@ -233,9 +233,9 @@ class DocumentReader:
                     if image.mode != 'RGB':
                         image = image.convert('RGB')
                     
-                    # Perform OCR on the image with comprehensive error handling
+                    # Perform OCR on the image with comprehensive error handling (no timeout - let it take as long as needed)
                     try:
-                        page_text = pytesseract.image_to_string(image, lang='eng', timeout=30)
+                        page_text = pytesseract.image_to_string(image, lang='eng')
                         if page_text.strip():
                             text_parts.append(page_text.strip())
                             logger.info(f"Extracted {len(page_text.strip())} characters from PDF page {page_num + 1} using OCR")
@@ -287,9 +287,9 @@ class DocumentReader:
             if image.mode != 'RGB':
                 image = image.convert('RGB')
             
-            # Perform OCR with comprehensive error handling
+            # Perform OCR with comprehensive error handling (no timeout - let it take as long as needed)
             try:
-                text = pytesseract.image_to_string(image, lang='eng', timeout=30)
+                text = pytesseract.image_to_string(image, lang='eng')
                 if text and text.strip():
                     logger.info(f"Successfully extracted {len(text.strip())} characters from image using OCR")
                     return text.strip()
