@@ -994,7 +994,10 @@ class EmailProcessor:
         
         # ✅ Extract and append attachment text for claims_paid classification
         # This is critical for distinguishing claims_paid_with_proof vs claims_paid_no_proof
+        # NOTE: Attachment content is ONLY for classification, NOT stored in MongoDB/CSV
         attachments_processed_count = 0
+        body_for_classification = clean_body  # Start with original body
+        
         if has_attachments:
             try:
                 access_token = self.graph_client.get_access_token()
@@ -1006,7 +1009,7 @@ class EmailProcessor:
                 )
                 
                 if attachment_content:
-                    clean_body = clean_body + attachment_content
+                    body_for_classification = clean_body + attachment_content
                     logger.info(f"Appended attachment text to email body for classification ({attachments_processed_count} attachment(s) processed)")
                 else:
                     logger.info("Attachments detected but no text extracted - classification will use email body only")
@@ -1033,14 +1036,14 @@ class EmailProcessor:
         
         # ✅ Call model API with enhanced attachment detection
         # Log metadata only (no PII/sensitive content)
-        body_length = len(clean_body)
+        body_length = len(body_for_classification)
         logger.info(f"Sending to model API: body_length={body_length}, has_attachments={has_attachments}, attachments_processed={attachments_processed_count}")
-        if "--- ATTACHMENT CONTENT ---" in clean_body:
+        if "--- ATTACHMENT CONTENT ---" in body_for_classification:
             logger.info("✅ Attachment content included in body for model classification")
         
         model_response = self.model_api.process_email_complete(
             subject=subject,
-            body=clean_body,
+            body=body_for_classification,
             headers=headers,
             sender_email=sender,
             recipient_emails=recipient_emails,
