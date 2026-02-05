@@ -77,7 +77,7 @@ def validate_config():
     logger.info("Configuration validation passed")
 
 class ModelAPIClient:
-    """Client for model API calls - 60 second timeout with manual review fallback."""
+    """Client for model API calls - 180 second timeout with manual review fallback."""
     
     def __init__(self):
         self.base_url = MODEL_API_URL
@@ -92,7 +92,7 @@ class ModelAPIClient:
 
     def process_email_complete(self, subject, body, headers=None, sender_email=None, 
                              recipient_emails=None, has_attachments=False, had_threads=False):
-        """Process email with model API - 60 second timeout, immediate response."""
+        """Process email with model API - 180 second timeout, immediate response."""
         payload = {
             "subject": subject,
             "body": body,
@@ -104,7 +104,7 @@ class ModelAPIClient:
         }
         
         try:
-            logger.info("Calling model API (60s timeout)...")
+            logger.info("Calling model API (180s timeout)...")
             start_time = time.time()
             
             # Single 180-second timeout - no retries needed
@@ -1027,10 +1027,9 @@ class EmailProcessor:
                 attachments_processed_count = 0
         
         # ✅ Call model API with enhanced attachment detection
-        # Log body length and preview for debugging
+        # Log metadata only (no PII/sensitive content)
         body_length = len(clean_body)
-        body_preview = clean_body[:200] + "..." if len(clean_body) > 200 else clean_body
-        logger.info(f"Sending to model API: body_length={body_length}, body_preview={body_preview}, has_attachments={has_attachments}, attachments_processed={attachments_processed_count}")
+        logger.info(f"Sending to model API: body_length={body_length}, has_attachments={has_attachments}, attachments_processed={attachments_processed_count}")
         if "--- ATTACHMENT CONTENT ---" in clean_body:
             logger.info("✅ Attachment content included in body for model classification")
         
