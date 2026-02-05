@@ -233,9 +233,21 @@ def html_to_text(html_content):
     """Convert HTML to clean text - exactly like test code."""
     if not html_content:
         return ""
-    
-    # Remove HTML tags
-    text = re.sub(r'<[^>]+>', '', html_content)
+
+    # Remove blocks that frequently contain non-user-visible noise.
+    # IMPORTANT: we must remove the *contents* of <style> and <script> blocks,
+    # not just the tags, otherwise CSS/JS becomes part of the "text" we send to the model.
+    text = html_content
+    text = re.sub(r"(?is)<!--.*?-->", " ", text)  # HTML comments
+    text = re.sub(r"(?is)<(script|style|head|title|meta)[^>]*>.*?</\\1>", " ", text)
+
+    # Add line breaks for common block/line-break tags before stripping tags.
+    text = re.sub(r"(?is)<br\\s*/?>", "\n", text)
+    text = re.sub(r"(?is)</(p|div|tr|li|h1|h2|h3|h4|h5|h6)>", "\n", text)
+    text = re.sub(r"(?is)<li[^>]*>", "- ", text)
+
+    # Remove remaining HTML tags
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
 
     # Decode HTML entities (critical for languages like Vietnamese that may be encoded
     # as named entities or numeric entities like &#x1EA1;)
@@ -319,17 +331,14 @@ def extract_clean_email_content(msg):
         # Fallback: return raw content
         return content, content_type or "unknown"
     
-    # Check if email has threads (compare lengths)
-    if unique_body and unique_body.get("content") and full_body and full_body.get("content"):
-        unique_content = unique_body.get("content", "").strip()
-        full_content = full_body.get("content", "").strip()
-        
-        if len(unique_content) > 0 and len(full_content) > len(unique_content) * 1.2:
-            had_threads = True
-    
     # Convert bodies to plain text for comparison / language preservation
     full_text, full_kind = _body_obj_to_text(full_body)
     unique_text, unique_kind = _body_obj_to_text(unique_body)
+
+    # Thread detection (more reliable): compare the *text* forms of body vs uniqueBody.
+    # Comparing raw HTML can produce false positives (e.g., style blocks, tracking markup).
+    if full_text and unique_text and len(unique_text) > 0 and len(full_text) > len(unique_text) * 1.2:
+        had_threads = True
 
     # Pick the best candidate (body vs uniqueBody) for language preservation.
     # Graph usually gives:
