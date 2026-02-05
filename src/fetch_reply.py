@@ -986,6 +986,13 @@ class EmailProcessor:
                     logger.info(f"Appended attachment text to email body for classification ({attachments_processed_count} attachment(s) processed)")
                 else:
                     logger.info("Attachments detected but no text extracted - classification will use email body only")
+            except (SystemExit, KeyboardInterrupt) as e:
+                # CRITICAL: Prevent SystemExit/KeyboardInterrupt from stopping the thread
+                logger.error(f"CRITICAL: SystemExit/KeyboardInterrupt raised during attachment processing for email {message_id}: {e}")
+                logger.error("This should not happen - preventing thread exit. Continuing email processing without attachment text")
+                import traceback
+                logger.error(f"Traceback:\n{traceback.format_exc()}")
+                attachments_processed_count = 0
             except ImportError as e:
                 logger.error(f"CRITICAL: Missing dependency for attachment processing: {e}")
                 logger.error("Please ensure pytesseract, pdfplumber, or PyPDF2 are installed")
