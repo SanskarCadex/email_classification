@@ -19,6 +19,7 @@ import httpx
 import msal
 import requests
 import re
+import html as html_lib
 import tempfile
 import traceback
 from datetime import datetime
@@ -235,15 +236,13 @@ def html_to_text(html_content):
     
     # Remove HTML tags
     text = re.sub(r'<[^>]+>', '', html_content)
+
+    # Decode HTML entities (critical for languages like Vietnamese that may be encoded
+    # as named entities or numeric entities like &#x1EA1;)
+    text = html_lib.unescape(text)
     
-    # Clean up HTML entities
-    entities = {
-        '&nbsp;': ' ', '&amp;': '&', '&lt;': '<', '&gt;': '>',
-        '&quot;': '"', '&#39;': "'", '\r\n': '\n', '\r': '\n'
-    }
-    
-    for entity, replacement in entities.items():
-        text = text.replace(entity, replacement)
+    # Normalize line breaks
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
     
     # Clean up whitespace
     text = re.sub(r'\n\s*\n', '\n\n', text)
@@ -260,6 +259,65 @@ def extract_clean_email_content(msg):
     # Get both uniqueBody and fullBody
     unique_body = msg.get("uniqueBody", {})
     full_body = msg.get("body", {})
+
+    def _count_non_ascii(text: str) -> int:
+        return sum(1 for c in (text or "") if ord(c) > 127)
+
+    def _count_vietnamese_chars(text: str) -> int:
+        """
+        Approx Vietnamese detection: count common Vietnamese-specific letters/diacritics.
+        Used only to avoid dropping Vietnamese when choosing uniqueBody vs body.
+        """
+        if not text:
+            return 0
+        vietnamese_letters = set(
+            "đĐ"
+            "ăĂâÂêÊôÔơƠưƯ"
+            "áàảãạÁÀẢÃẠ"
+            "ấầẩẫậẤẦẨẪẬ"
+            "ắằẳẵặẮẰẲẴẶ"
+            "éèẻẽẹÉÈẺẼẸ"
+            "ếềểễệẾỀỂỄỆ"
+            "íìỉĩịÍÌỈĨỊ"
+            "óòỏõọÓÒỎÕỌ"
+            "ốồổỗộỐỒỔỖỘ"
+            "ớờởỡợỚỜỞỠỢ"
+            "úùủũụÚÙỦŨỤ"
+            "ứừửữựỨỪỬỮỰ"
+            "ýỳỷỹỵÝỲỶỸỴ"
+        )
+        return sum(1 for c in text if c in vietnamese_letters)
+
+    def _score_body_candidate(text: str) -> int:
+        """
+        Score a candidate body so we prefer preserving language (e.g., Vietnamese) over
+        "shortest/newest wins" behavior.
+
+        Mirrors the idea used in testing_client/test.py:
+        - Vietnamese chars dominate
+        - then non-ascii density
+        - then length
+        """
+        vn = _count_vietnamese_chars(text or "")
+        na = _count_non_ascii(text or "")
+        ln = len(text or "")
+        return vn * 1_000_000 + na * 1_000 + ln
+
+    def _body_obj_to_text(body_obj: Dict[str, Any]) -> Tuple[str, str]:
+        """
+        Convert Graph body object to plain text consistently for scoring/comparison.
+        Returns (text, source_suffix) where suffix is 'text' or 'html' or 'unknown'.
+        """
+        if not body_obj or not body_obj.get("content"):
+            return "", "missing"
+        content = (body_obj.get("content") or "").strip()
+        content_type = (body_obj.get("contentType") or "").lower()
+        if content_type == "text":
+            return content, "text"
+        if content_type == "html":
+            return html_to_text(content), "html"
+        # Fallback: return raw content
+        return content, content_type or "unknown"
     
     # Check if email has threads (compare lengths)
     if unique_body and unique_body.get("content") and full_body and full_body.get("content"):
@@ -269,42 +327,65 @@ def extract_clean_email_content(msg):
         if len(unique_content) > 0 and len(full_content) > len(unique_content) * 1.2:
             had_threads = True
     
-    # FIX: Match test.py behavior - when had_threads=False, use FULL body (like test.py uses full .eml)
-    # This ensures the model sees the same content as test.py for non-threaded emails
-    if not had_threads and full_body and full_body.get("content"):
-        # Use full body for non-threaded emails (matches test.py behavior)
-        content = full_body.get("content", "").strip()
-        content_type = full_body.get("contentType", "").lower()
-        
-        if content_type == "text":
-            clean_body = content
-            data_source = "body_text"
-        elif content_type == "html":
-            clean_body = html_to_text(content)
-            data_source = "body_html"
-    elif had_threads and unique_body and unique_body.get("content"):
-        # For threaded emails, use uniqueBody (current reply only)
-        content = unique_body.get("content", "").strip()
-        content_type = unique_body.get("contentType", "").lower()
-        
-        if content_type == "text":
-            clean_body = content
-            data_source = "uniqueBody_text"
-        elif content_type == "html":
-            clean_body = html_to_text(content)
-            data_source = "uniqueBody_html"
+    # Convert bodies to plain text for comparison / language preservation
+    full_text, full_kind = _body_obj_to_text(full_body)
+    unique_text, unique_kind = _body_obj_to_text(unique_body)
+
+    # Pick the best candidate (body vs uniqueBody) for language preservation.
+    # Graph usually gives:
+    # - body: full message
+    # - uniqueBody: current reply (when threads exist)
+    full_score = _score_body_candidate(full_text)
+    unique_score = _score_body_candidate(unique_text)
+
+    # Non-threaded: prefer the highest scoring candidate (usually full body, but not always).
+    if not had_threads:
+        if full_text and (full_score >= unique_score):
+            clean_body = full_text
+            data_source = f"body_{full_kind}"
+        elif unique_text:
+            clean_body = unique_text
+            data_source = f"uniqueBody_{unique_kind}"
+
+    # Threaded: default to uniqueBody (current reply), but keep full body if language would be lost.
+    elif had_threads and unique_text:
+        # Default behavior: for threaded emails, use uniqueBody (current reply only)
+        clean_body = unique_text
+        data_source = f"uniqueBody_{unique_kind}"
+
+        # 🛡️ Language preservation guard:
+        # If using uniqueBody would drop most non-ASCII/Vietnamese characters,
+        # fall back to full body content so we send the actual language to the model.
+        if full_text:
+            full_non_ascii = _count_non_ascii(full_text)
+            unique_non_ascii = _count_non_ascii(unique_text)
+            full_vn = _count_vietnamese_chars(full_text)
+            unique_vn = _count_vietnamese_chars(unique_text)
+
+            should_keep_full_for_language = False
+
+            # If full has Vietnamese but unique does not, keep full
+            if full_vn > 0 and unique_vn == 0:
+                should_keep_full_for_language = True
+            # Or if full has lots of non-ascii and unique drops most of it, keep full
+            elif full_non_ascii > 0 and unique_non_ascii < full_non_ascii * 0.5:
+                should_keep_full_for_language = True
+            # Or if the overall scoring strongly favors the full body, keep full
+            elif full_score > unique_score and (full_vn > unique_vn or full_non_ascii > unique_non_ascii):
+                should_keep_full_for_language = True
+
+            if should_keep_full_for_language:
+                logger.info(
+                    "🛡️ had_threads=True but keeping FULL body for language preservation "
+                    f"(vn full={full_vn}, unique={unique_vn}; non_ascii full={full_non_ascii}, unique={unique_non_ascii})"
+                )
+                clean_body = full_text
+                data_source = f"body_{full_kind}_language_guard"
     
     # Fallback to full body if uniqueBody didn't work for threaded emails
-    if not clean_body and full_body and full_body.get("content"):
-        content = full_body.get("content", "").strip()
-        content_type = full_body.get("contentType", "").lower()
-        
-        if content_type == "text":
-            clean_body = content
-            data_source = "body_text"
-        elif content_type == "html":
-            clean_body = html_to_text(content)
-            data_source = "body_html"
+    if not clean_body and full_text:
+        clean_body = full_text
+        data_source = f"body_{full_kind}"
     
     # Last resort: bodyPreview
     if not clean_body:
