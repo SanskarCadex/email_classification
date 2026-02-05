@@ -84,9 +84,14 @@ def run_email_processor_wrapper():
     except KeyboardInterrupt:
         logger.info("Email processor thread interrupted by KeyboardInterrupt")
         processor_running = False
-    except SystemExit:
-        logger.warning("Email processor thread received SystemExit - this should not happen")
+    except SystemExit as e:
+        logger.warning(f"Email processor thread received SystemExit - this should not happen. Exit code: {e.code}")
+        logger.warning("SystemExit caught - preventing thread exit. This may indicate a bug in the code calling sys.exit()")
+        import traceback
+        logger.warning(f"SystemExit traceback:\n{traceback.format_exc()}")
         processor_running = False
+        # DON'T re-raise SystemExit - prevent thread from exiting
+        # Instead, log and continue (thread will stop but we've logged the issue)
     except Exception as e:
         logger.exception(f"CRITICAL: Email processor thread crashed with exception: {e}")
         logger.error(f"Exception type: {type(e).__name__}")
