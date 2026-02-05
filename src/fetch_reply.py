@@ -1007,7 +1007,7 @@ class EmailProcessor:
         # Log body length and preview for debugging
         body_length = len(clean_body)
         body_preview = clean_body[:200] + "..." if len(clean_body) > 200 else clean_body
-        logger.info(f"Sending to model API: body_length={body_length}, has_attachments={has_attachments}, attachments_processed={attachments_processed_count}")
+        logger.info(f"Sending to model API: body_length={body_length}, body_preview={body_preview}, has_attachments={has_attachments}, attachments_processed={attachments_processed_count}")
         if "--- ATTACHMENT CONTENT ---" in clean_body:
             logger.info("✅ Attachment content included in body for model classification")
         
