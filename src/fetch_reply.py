@@ -20,6 +20,7 @@ import msal
 import requests
 import re
 import tempfile
+import traceback
 from datetime import datetime
 from typing import Dict, Optional, List, Any, Tuple
 from dotenv import load_dotenv
@@ -1009,16 +1010,17 @@ class EmailProcessor:
                     logger.info(f"Appended attachment text to email body for classification ({attachments_processed_count} attachment(s) processed)")
                 else:
                     logger.info("Attachments detected but no text extracted - classification will use email body only")
-            except (SystemExit, KeyboardInterrupt) as e:
-                # CRITICAL: SystemExit from DocumentReader/pytesseract should not stop the thread
-                # This can happen when pytesseract.get_tesseract_version() fails due to library issues
-                # Log the error but continue processing without attachment text
-                logger.error(f"CRITICAL: SystemExit/KeyboardInterrupt raised during attachment processing for email {message_id}: {e}")
-                logger.warning("This is likely a pytesseract/Dynatrace library issue - continuing email processing without attachment text")
-                import traceback
+            except KeyboardInterrupt:
+                # Always re-raise KeyboardInterrupt to allow graceful shutdown
+                logger.warning("KeyboardInterrupt received during attachment processing - stopping")
+                raise
+            except SystemExit as e:
+                # SystemExit from pytesseract library issues should not stop the thread
+                # This can happen when pytesseract.get_tesseract_version() fails
+                logger.error(f"SystemExit raised during attachment processing for email {message_id}: {e}")
+                logger.warning("This is likely a pytesseract library issue - continuing email processing without attachment text")
                 logger.error(f"Traceback:\n{traceback.format_exc()}")
                 attachments_processed_count = 0
-                # DON'T re-raise - allow email processing to continue without attachment text
             except ImportError as e:
                 logger.error(f"CRITICAL: Missing dependency for attachment processing: {e}")
                 logger.error("Please ensure pytesseract, pdfplumber, or PyPDF2 are installed")
