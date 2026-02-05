@@ -87,11 +87,8 @@ def check_model_health(max_retries: int = 3, base_timeout: int = 60) -> bool:
 
 
 def get_batch_size():
-    """Get batch size from runtime override or .env"""
-    runtime_size = os.getenv("RUNTIME_BATCH_SIZE")
-    if runtime_size:
-        return int(runtime_size)
-    return int(os.getenv("BATCH_SIZE", 50))
+    """Get batch size - hardcoded to 50"""
+    return 50
 
 def get_batch_interval():
     """Get batch interval in seconds (convert minutes to seconds)"""
@@ -1074,8 +1071,14 @@ def run_email_processor(stop_event=None):
             # Reset failure counter on successful health check
             consecutive_failures = 0
             
-            # Run main batch processor with stop signal
-            run_batch_processor(stop_event)
+            # Run main batch processor with stop signal - wrap in try-except to catch any silent failures
+            try:
+                run_batch_processor(stop_event)
+            except Exception as e:
+                logger.exception(f"CRITICAL: run_batch_processor crashed with exception: {e}")
+                logger.error("This should not happen - batch processor should handle all exceptions internally")
+                # Don't break - let the outer exception handler deal with it
+                raise
            
             # Calculate time to next batch
             elapsed = (datetime.now() - start_time).total_seconds()
