@@ -239,10 +239,10 @@ def html_to_text(html_content):
     # not just the tags, otherwise CSS/JS becomes part of the "text" we send to the model.
     text = html_content
     text = re.sub(r"(?is)<!--.*?-->", " ", text)  # HTML comments
-    text = re.sub(r"(?is)<(script|style|head|title|meta)[^>]*>.*?</\\1>", " ", text)
+    text = re.sub(r"(?is)<(script|style|head|title|meta)[^>]*>.*?</\1>", " ", text)
 
     # Add line breaks for common block/line-break tags before stripping tags.
-    text = re.sub(r"(?is)<br\\s*/?>", "\n", text)
+    text = re.sub(r"(?is)<br\s*/?>", "\n", text)
     text = re.sub(r"(?is)</(p|div|tr|li|h1|h2|h3|h4|h5|h6)>", "\n", text)
     text = re.sub(r"(?is)<li[^>]*>", "- ", text)
 
