@@ -107,11 +107,11 @@ class ModelAPIClient:
             logger.info("Calling model API (60s timeout)...")
             start_time = time.time()
             
-            # Single 60-second timeout - no retries needed
+            # Single 180-second timeout - no retries needed
             response = requests.post(
                 f"{self.base_url}/api/process_email_complete", 
                 json=payload, 
-                timeout=180  # 60 seconds max
+                timeout=180  # 180 seconds max
             )
             response.raise_for_status()
             result = response.json()
@@ -809,6 +809,37 @@ class EmailProcessor:
         if self.mongo:
             self.mongo.set_batch_id(batch_id)
     
+    def _create_draft_with_retry(self, message_id: str, reply_text: str, source_account: str, 
+                                  context: str = "draft") -> str:
+        """Create threaded reply draft with retry logic.
+        
+        Args:
+            message_id: Original message ID to reply to
+            reply_text: Reply content
+            source_account: Email account
+            context: Description for logging (e.g., "invoice ack", "fallback", "threaded")
+        
+        Returns:
+            Draft ID if successful, None otherwise
+        """
+        for attempt in range(1, 4):
+            draft_id = self.graph_client.create_threaded_reply_draft(
+                message_id, reply_text, source_account
+            )
+            if draft_id:
+                logger.info(f"{context.capitalize()} draft created successfully (attempt {attempt}/3): {draft_id}")
+                return draft_id
+            
+            if attempt < 3:
+                logger.warning(f"{context.capitalize()} draft creation failed (attempt {attempt}/3) - retrying...")
+                time.sleep(2)  # Brief delay before retry
+            else:
+                logger.error(f"❌ CRITICAL: {context.capitalize()} draft creation FAILED after 3 attempts for email {message_id}")
+                if reply_text:
+                    logger.error(f"   Reply text was generated ({len(reply_text)} chars) but draft could not be created")
+        
+        return None
+    
     def _process_single_email(self, msg):
         """Process a single email with UNIFIED stop signal and enhanced attachment detection."""
         # CHECK UNIFIED STOP BEFORE PROCESSING EACH EMAIL
@@ -1139,24 +1170,9 @@ class EmailProcessor:
                     reply_text = first_reply_text or ""
                     if reply_text:
                         # ✅ RETRY: Try to create draft up to 3 times
-                        draft_id = None
-                        for draft_attempt in range(1, 4):
-                            draft_id = self.graph_client.create_threaded_reply_draft(
-                                message_id, reply_text, source_account
-                            )
-                            if draft_id:
-                                draft_created = True
-                                logger.info(f"Invoice ack draft saved successfully (attempt {draft_attempt}/3): {draft_id}")
-                                break
-                            else:
-                                if draft_attempt < 3:
-                                    logger.warning(f"Invoice ack draft creation failed (attempt {draft_attempt}/3) - retrying...")
-                                    time.sleep(2)  # Brief delay before retry
-                                else:
-                                    logger.error(f"❌ CRITICAL: Invoice ack draft creation FAILED after 3 attempts for email {message_id}")
-                                    logger.error(f"   Reply text was generated ({len(reply_text)} chars) but draft could not be created")
-                        
+                        draft_id = self._create_draft_with_retry(message_id, reply_text, source_account, "invoice ack")
                         if draft_id:
+                            draft_created = True
                             logger.info(f"Invoice ack draft saved (no second email will be created): {draft_id}")
                         else:
                             logger.error(f"❌ CRITICAL: Invoice ack draft NOT created after 3 attempts - email {message_id} will be processed without draft")
@@ -1232,24 +1248,11 @@ class EmailProcessor:
                             
                             # Always create the second as a draft first (so we can attach invoice if available)
                             # ✅ RETRY: Try to create draft up to 3 times
-                            second_draft_id = None
-                            for draft_attempt in range(1, 4):
-                                second_draft_id = self.graph_client.create_threaded_reply_draft(
-                                    message_id, second_reply_text, source_account
-                                )
-                                if second_draft_id:
-                                    draft_created = True
-                                    draft_id = second_draft_id  # Persist latest draft id to MongoDB
-                                    logger.info(f"Invoice main draft created successfully (attempt {draft_attempt}/3): {second_draft_id}")
-                                    break
-                                else:
-                                    if draft_attempt < 3:
-                                        logger.warning(f"Invoice main draft creation failed (attempt {draft_attempt}/3) - retrying...")
-                                        time.sleep(2)  # Brief delay before retry
-                                    else:
-                                        logger.error(f"❌ CRITICAL: Invoice main draft creation FAILED after 3 attempts for email {message_id}")
-                                        logger.error(f"   Reply text was generated ({len(second_reply_text)} chars) but draft could not be created")
-                            
+                            second_draft_id = self._create_draft_with_retry(message_id, second_reply_text, source_account, "invoice main")
+                            if second_draft_id:
+                                draft_created = True
+                                draft_id = second_draft_id  # Persist latest draft id to MongoDB
+                                logger.info(f"Invoice main draft created: {second_draft_id}")
                             if second_draft_id:
                                 logger.info(f"Invoice main draft created: {second_draft_id}")
                                 
@@ -1377,64 +1380,25 @@ class EmailProcessor:
                             else:
                                 logger.warning("Direct send failed, creating draft instead")
                                 # ✅ RETRY: Try to create draft up to 3 times
-                                draft_id = None
-                                for draft_attempt in range(1, 4):
-                                    draft_id = self.graph_client.create_threaded_reply_draft(
-                                        message_id, reply_text, source_account
-                                    )
-                                    if draft_id:
-                                        draft_created = True
-                                        logger.info(f"Fallback draft created successfully (attempt {draft_attempt}/3): {draft_id}")
-                                        break
-                                    else:
-                                        if draft_attempt < 3:
-                                            logger.warning(f"Fallback draft creation failed (attempt {draft_attempt}/3) - retrying...")
-                                            time.sleep(2)
-                                        else:
-                                            logger.error(f"❌ CRITICAL: Fallback draft creation FAILED after 3 attempts for email {message_id}")
-                                
+                                draft_id = self._create_draft_with_retry(message_id, reply_text, source_account, "fallback")
+                                if draft_id:
+                                    draft_created = True
                                 if not draft_id:
                                     logger.error(f"❌ CRITICAL: Fallback draft NOT created after 3 attempts - email {message_id} will be processed without draft")
                         except Exception as e:
                             logger.error(f"Error sending email directly: {e}, creating draft instead")
                             # ✅ RETRY: Try to create draft up to 3 times
-                            draft_id = None
-                            for draft_attempt in range(1, 4):
-                                draft_id = self.graph_client.create_threaded_reply_draft(
-                                    message_id, reply_text, source_account
-                                )
-                                if draft_id:
-                                    draft_created = True
-                                    logger.info(f"Fallback draft created successfully (attempt {draft_attempt}/3): {draft_id}")
-                                    break
-                                else:
-                                    if draft_attempt < 3:
-                                        logger.warning(f"Fallback draft creation failed (attempt {draft_attempt}/3) - retrying...")
-                                        time.sleep(2)
-                                    else:
-                                        logger.error(f"❌ CRITICAL: Fallback draft creation FAILED after 3 attempts for email {message_id}")
-                            
+                            draft_id = self._create_draft_with_retry(message_id, reply_text, source_account, "fallback")
+                            if draft_id:
+                                draft_created = True
                             if not draft_id:
                                 logger.error(f"❌ CRITICAL: Fallback draft NOT created after 3 attempts - email {message_id} will be processed without draft")
                     else:
                         # Create draft as usual
                         # ✅ RETRY: Try to create draft up to 3 times
-                        draft_id = None
-                        for draft_attempt in range(1, 4):
-                            draft_id = self.graph_client.create_threaded_reply_draft(
-                                message_id, reply_text, source_account
-                            )
-                            if draft_id:
-                                draft_created = True
-                                logger.info(f"Threaded draft saved successfully (attempt {draft_attempt}/3): {draft_id}")
-                                break
-                            else:
-                                if draft_attempt < 3:
-                                    logger.warning(f"Draft creation failed (attempt {draft_attempt}/3) - retrying...")
-                                    time.sleep(2)
-                                else:
-                                    logger.error(f"❌ CRITICAL: Draft creation FAILED after 3 attempts for email {message_id}")
-                        
+                        draft_id = self._create_draft_with_retry(message_id, reply_text, source_account, "threaded")
+                        if draft_id:
+                            draft_created = True
                         if not draft_id:
                             logger.error(f"❌ CRITICAL: Draft NOT created after 3 attempts - email {message_id} will be processed without draft")
                             # draft_created remains False (default)
@@ -1529,6 +1493,10 @@ class EmailProcessor:
                     folder_mapping = self.graph_client.ensure_classification_folders(email_address)
                     if folder_mapping:
                         self.folder_mappings[email_address] = folder_mapping
+                except httpx.HTTPError as e:
+                    logger.error(f"HTTP error setting up folders for {email_address}: {e}", exc_info=True)
+                except httpx.TimeoutException as e:
+                    logger.error(f"Timeout setting up folders for {email_address}: {e}", exc_info=True)
                 except Exception as e:
                     logger.error(f"Failed to setup folders for {email_address}: {e}", exc_info=True)
             
