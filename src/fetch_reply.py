@@ -152,7 +152,6 @@ class ModelAPIClient:
             "entities": entities or {}
         }
         
-        last_error = None
         for attempt in range(1, max_retries + 1):
             try:
                 logger.info(f"Generating reply for {label} (attempt {attempt}/{max_retries}, 60s timeout)...")
@@ -185,7 +184,6 @@ class ModelAPIClient:
                         return ""
                 
             except requests.exceptions.Timeout:
-                last_error = "Timeout after 60s"
                 logger.warning(f"Reply generation timeout for {label} (attempt {attempt}/{max_retries})")
                 if attempt < max_retries:
                     logger.info(f"Retrying reply generation for {label} after timeout...")
@@ -196,7 +194,6 @@ class ModelAPIClient:
                     return ""
                 
             except requests.exceptions.RequestException as e:
-                last_error = str(e)
                 logger.error(f"Reply generation error for {label} (attempt {attempt}/{max_retries}): {e}")
                 if attempt < max_retries:
                     logger.info(f"Retrying reply generation for {label} after error...")
@@ -207,7 +204,6 @@ class ModelAPIClient:
                     return ""
                 
             except Exception as e:
-                last_error = str(e)
                 logger.error(f"Unexpected reply error for {label} (attempt {attempt}/{max_retries}): {e}")
                 if attempt < max_retries:
                     logger.info(f"Retrying reply generation for {label} after unexpected error...")
@@ -216,10 +212,6 @@ class ModelAPIClient:
                 else:
                     logger.error(f"Reply generation failed after {max_retries} attempts due to unexpected error for {label}: {e}")
                     return ""
-        
-        # Should not reach here, but just in case
-        logger.error(f"Reply generation failed for {label} after {max_retries} attempts. Last error: {last_error}")
-        return ""
 
     def _get_manual_review_fallback(self):
         """Fallback response for failed API calls - sends to manual review."""
@@ -1018,12 +1010,12 @@ class EmailProcessor:
                 else:
                     logger.info("Attachments detected but no text extracted - classification will use email body only")
             except (SystemExit, KeyboardInterrupt) as e:
-                # CRITICAL: Prevent SystemExit/KeyboardInterrupt from stopping the thread
+                # CRITICAL: Log context but let control exceptions propagate for clean shutdown
                 logger.error(f"CRITICAL: SystemExit/KeyboardInterrupt raised during attachment processing for email {message_id}: {e}")
-                logger.error("This should not happen - preventing thread exit. Continuing email processing without attachment text")
                 import traceback
                 logger.error(f"Traceback:\n{traceback.format_exc()}")
-                attachments_processed_count = 0
+                # Re-raise to allow clean application shutdown
+                raise
             except ImportError as e:
                 logger.error(f"CRITICAL: Missing dependency for attachment processing: {e}")
                 logger.error("Please ensure pytesseract, pdfplumber, or PyPDF2 are installed")
@@ -1253,8 +1245,6 @@ class EmailProcessor:
                                 draft_created = True
                                 draft_id = second_draft_id  # Persist latest draft id to MongoDB
                                 logger.info(f"Invoice main draft created: {second_draft_id}")
-                            if second_draft_id:
-                                logger.info(f"Invoice main draft created: {second_draft_id}")
                                 
                                 # Try to fetch invoice(s) and attach (non-blocking if fails)
                                 invoice_file_paths: List[str] = []
@@ -1383,7 +1373,7 @@ class EmailProcessor:
                                 draft_id = self._create_draft_with_retry(message_id, reply_text, source_account, "fallback")
                                 if draft_id:
                                     draft_created = True
-                                if not draft_id:
+                                else:
                                     logger.error(f"❌ CRITICAL: Fallback draft NOT created after 3 attempts - email {message_id} will be processed without draft")
                         except Exception as e:
                             logger.error(f"Error sending email directly: {e}, creating draft instead")
@@ -1391,7 +1381,7 @@ class EmailProcessor:
                             draft_id = self._create_draft_with_retry(message_id, reply_text, source_account, "fallback")
                             if draft_id:
                                 draft_created = True
-                            if not draft_id:
+                            else:
                                 logger.error(f"❌ CRITICAL: Fallback draft NOT created after 3 attempts - email {message_id} will be processed without draft")
                     else:
                         # Create draft as usual
@@ -1399,7 +1389,7 @@ class EmailProcessor:
                         draft_id = self._create_draft_with_retry(message_id, reply_text, source_account, "threaded")
                         if draft_id:
                             draft_created = True
-                        if not draft_id:
+                        else:
                             logger.error(f"❌ CRITICAL: Draft NOT created after 3 attempts - email {message_id} will be processed without draft")
                             # draft_created remains False (default)
         
