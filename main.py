@@ -81,8 +81,23 @@ def run_email_processor_wrapper():
         logger.info("Starting email processor thread...")
         run_email_processor(stop_event)
         logger.info("Email processor thread completed normally")
+    except KeyboardInterrupt:
+        logger.info("Email processor thread interrupted by KeyboardInterrupt")
+        processor_running = False
+    except SystemExit:
+        logger.warning("Email processor thread received SystemExit - this should not happen")
+        processor_running = False
     except Exception as e:
         logger.exception(f"CRITICAL: Email processor thread crashed with exception: {e}")
+        logger.error(f"Exception type: {type(e).__name__}")
+        logger.error(f"Exception args: {e.args}")
+        import traceback
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+        processor_running = False
+    except BaseException as e:
+        # Catch even base exceptions (like SystemExit, KeyboardInterrupt)
+        logger.exception(f"CRITICAL: Email processor thread crashed with base exception: {e}")
+        logger.error(f"Exception type: {type(e).__name__}")
         processor_running = False
     finally:
         processor_running = False
