@@ -1010,12 +1010,15 @@ class EmailProcessor:
                 else:
                     logger.info("Attachments detected but no text extracted - classification will use email body only")
             except (SystemExit, KeyboardInterrupt) as e:
-                # CRITICAL: Log context but let control exceptions propagate for clean shutdown
+                # CRITICAL: SystemExit from DocumentReader/pytesseract should not stop the thread
+                # This can happen when pytesseract.get_tesseract_version() fails due to library issues
+                # Log the error but continue processing without attachment text
                 logger.error(f"CRITICAL: SystemExit/KeyboardInterrupt raised during attachment processing for email {message_id}: {e}")
+                logger.warning("This is likely a pytesseract/Dynatrace library issue - continuing email processing without attachment text")
                 import traceback
                 logger.error(f"Traceback:\n{traceback.format_exc()}")
-                # Re-raise to allow clean application shutdown
-                raise
+                attachments_processed_count = 0
+                # DON'T re-raise - allow email processing to continue without attachment text
             except ImportError as e:
                 logger.error(f"CRITICAL: Missing dependency for attachment processing: {e}")
                 logger.error("Please ensure pytesseract, pdfplumber, or PyPDF2 are installed")

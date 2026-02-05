@@ -67,17 +67,10 @@ class DocumentReader:
         except ImportError:
             self.use_pdfplumber = False
         
-        # Verify Tesseract is actually working, not just imported
+        # Don't verify tesseract version here - let it fail gracefully when actually used
+        # This matches the working testing_client code and avoids SystemExit issues
         if self.tesseract_available:
-            try:
-                import pytesseract
-                # Test if tesseract binary is accessible
-                pytesseract.get_tesseract_version()
-                logger.info("Tesseract OCR is available and working")
-            except Exception as e:
-                logger.error(f"Tesseract OCR imported but not working: {e}")
-                logger.error("Please ensure Tesseract OCR is installed: brew install tesseract (macOS) or apt-get install tesseract-ocr (Linux)")
-                self.tesseract_available = False
+            logger.info("Tesseract OCR is available (will be tested when actually used)")
         
         if not self.tesseract_available:
             logger.warning("Tesseract OCR not available. Image OCR will be disabled.")
