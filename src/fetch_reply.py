@@ -41,8 +41,8 @@ EMAIL_ADDRESS = "ABCcollectionsteamD@abc-amega.com,ABCcollectionsteamI@abc-amega
 YOUR_DOMAIN = os.getenv("YOUR_DOMAIN", "abc-amega.com")
 MODEL_API_URL = "http://104.197.197.76:8000"
 COMPANY_NAME = os.getenv("COMPANY_NAME", "ABC/AMEGA")
-SEND_INVOICE_REQUEST_NO_INFO = False  # Set to True to send directly, False for draft
-SEND_CLAIMS_PAID_NO_PROOF = False     # Set to True to send directly, False for draft
+SEND_INVOICE_REQUEST_NO_INFO = True   # Set to True to send directly, False for draft
+SEND_CLAIMS_PAID_NO_PROOF = True      # Set to True to send directly, False for draft
 SEND_INVOICE_WITH_ATTACHMENT = False  # Set to True to send the SECOND invoice email directly, False for draft (only runs if first was sent)
 
 # Updated list of allowed labels
