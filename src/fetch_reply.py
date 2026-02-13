@@ -340,66 +340,14 @@ def extract_clean_email_content(msg):
     if full_text and unique_text and len(unique_text) > 0 and len(full_text) > len(unique_text) * 1.2:
         had_threads = True
 
-    # Pick the best candidate (body vs uniqueBody) for language preservation.
-    # Graph usually gives:
-    # - body: full message
-    # - uniqueBody: current reply (when threads exist)
-    full_score = _score_body_candidate(full_text)
-    unique_score = _score_body_candidate(unique_text)
-
-    # Non-threaded: prefer the highest scoring candidate (usually full body, but not always).
-    if not had_threads:
-        if full_text and (full_score >= unique_score):
-            clean_body = full_text
-            data_source = f"body_{full_kind}"
-        elif unique_text:
-            clean_body = unique_text
-            data_source = f"uniqueBody_{unique_kind}"
-
-    # Threaded: default to uniqueBody (current reply), but keep full body if language would be lost.
-    elif had_threads and unique_text:
-        # Default behavior: for threaded emails, use uniqueBody (current reply only)
-        clean_body = unique_text
-        data_source = f"uniqueBody_{unique_kind}"
-
-        # 🛡️ Language preservation guard:
-        # If using uniqueBody would drop most non-ASCII/Vietnamese characters,
-        # fall back to full body content so we send the actual language to the model.
-        if full_text:
-            full_non_ascii = _count_non_ascii(full_text)
-            unique_non_ascii = _count_non_ascii(unique_text)
-            full_vn = _count_vietnamese_chars(full_text)
-            unique_vn = _count_vietnamese_chars(unique_text)
-
-            should_keep_full_for_language = False
-
-            # If full has Vietnamese but unique does not, keep full
-            if full_vn > 0 and unique_vn == 0:
-                should_keep_full_for_language = True
-            # Or if full has lots of non-ascii and unique drops most of it, keep full
-            elif full_non_ascii > 0 and unique_non_ascii < full_non_ascii * 0.5:
-                should_keep_full_for_language = True
-            # Or if the overall scoring strongly favors the full body, keep full
-            elif full_score > unique_score and (full_vn > unique_vn or full_non_ascii > unique_non_ascii):
-                should_keep_full_for_language = True
-
-            if should_keep_full_for_language:
-                logger.info(
-                    "🛡️ had_threads=True but keeping FULL body for language preservation "
-                    f"(vn full={full_vn}, unique={unique_vn}; non_ascii full={full_non_ascii}, unique={unique_non_ascii})"
-                )
-                clean_body = full_text
-                data_source = f"body_{full_kind}_language_guard"
-    
-    # Fallback to full body if uniqueBody didn't work for threaded emails
-    if not clean_body and full_text:
+    # LANGUAGE PRESERVATION: Always use Graph body.content (full_text).
+    # uniqueBody and bodyPreview are Exchange-processed fields and are NOT used as content sources.
+    if full_text:
         clean_body = full_text
         data_source = f"body_{full_kind}"
-    
-    # Last resort: bodyPreview
-    if not clean_body:
-        clean_body = msg.get("bodyPreview", "").strip()
-        data_source = "bodyPreview"
+    else:
+        clean_body = ""
+        data_source = "empty"
     
     return clean_body, data_source, had_threads
 
@@ -1082,13 +1030,24 @@ class EmailProcessor:
             logger.info("STOP: Stop signal detected before model API call - stopping NOW")
             return False
         
-        # ✅ Extract and append attachment text for claims_paid classification
-        # This is critical for distinguishing claims_paid_with_proof vs claims_paid_no_proof
-        # NOTE: Attachment content is ONLY for classification, NOT stored in MongoDB/CSV
+        # LANGUAGE PRESERVATION: 3-path decision logic (body OR attachment, never concatenate)
+        MEANINGFUL_BODY_MIN_CHARS = 30
+        body_text_clean = clean_body.strip() if clean_body else ""
+        body_is_meaningful = len(body_text_clean) >= MEANINGFUL_BODY_MIN_CHARS
+
+        attachment_content = ""
         attachments_processed_count = 0
-        body_for_classification = clean_body  # Start with original body
-        
-        if has_attachments:
+        classification_source = "none"
+
+        # PATH 1: meaningful body → classify on body only
+        if body_is_meaningful:
+            body_for_classification = body_text_clean
+            classification_source = "body"
+            logger.info(f"Classification source: BODY ({len(body_text_clean)} chars, had_threads={had_threads})")
+            logger.info("Attachments will NOT be appended for classification (body is meaningful)")
+
+        # PATH 2: short/empty body + attachments → classify on attachment only
+        elif has_attachments:
             try:
                 access_token = self.graph_client.get_access_token()
                 attachment_content, attachments_processed_count = get_formatted_attachment_content_for_classification(
@@ -1097,49 +1056,119 @@ class EmailProcessor:
                     access_token=access_token,
                     base_url=MS_GRAPH_BASE_URL
                 )
-                
-                if attachment_content:
-                    body_for_classification = clean_body + attachment_content
-                    logger.info(f"Appended attachment text to email body for classification ({attachments_processed_count} attachment(s) processed)")
-                else:
-                    logger.info("Attachments detected but no text extracted - classification will use email body only")
             except KeyboardInterrupt:
                 # Always re-raise KeyboardInterrupt to allow graceful shutdown
                 logger.warning("KeyboardInterrupt received during attachment processing - stopping")
                 raise
             except SystemExit as e:
-                # SystemExit from pytesseract library issues should not stop the thread
-                # This can happen when pytesseract.get_tesseract_version() fails
                 logger.error(f"SystemExit raised during attachment processing for email {message_id}: {e}")
-                logger.warning("This is likely a pytesseract library issue - continuing email processing without attachment text")
-                logger.error(f"Traceback:\n{traceback.format_exc()}")
+                logger.warning("This is likely a pytesseract library issue - continuing without attachment text")
+                attachment_content = ""
                 attachments_processed_count = 0
             except ImportError as e:
                 logger.error(f"CRITICAL: Missing dependency for attachment processing: {e}")
                 logger.error("Please ensure pytesseract, pdfplumber, or PyPDF2 are installed")
-                logger.warning("Continuing email processing without attachment text")
+                logger.warning("Continuing without attachment text")
+                attachment_content = ""
                 attachments_processed_count = 0
             except Exception as e:
                 logger.error(f"CRITICAL: Error extracting attachment text for email {message_id}: {e}", exc_info=True)
-                logger.warning("Continuing email processing without attachment text - this email will be classified using body only")
+                logger.warning("Continuing without attachment text")
+                attachment_content = ""
                 attachments_processed_count = 0
-        
-        # ✅ Call model API with enhanced attachment detection
-        # Log metadata only (no PII/sensitive content)
-        body_length = len(body_for_classification)
-        logger.info(f"Sending to model API: body_length={body_length}, has_attachments={has_attachments}, attachments_processed={attachments_processed_count}")
-        if "--- ATTACHMENT CONTENT ---" in body_for_classification:
-            logger.info("✅ Attachment content included in body for model classification")
-        
-        model_response = self.model_api.process_email_complete(
-            subject=subject,
-            body=body_for_classification,
-            headers=headers,
-            sender_email=sender,
-            recipient_emails=recipient_emails,
-            has_attachments=has_attachments,  # Enhanced detection included
-            had_threads=had_threads
-        )
+
+            if attachment_content and attachment_content.strip():
+                body_for_classification = attachment_content
+                classification_source = "attachment"
+                logger.info(f"Classification source: ATTACHMENT ({attachments_processed_count} attachment(s), body was empty/short)")
+            else:
+                body_for_classification = ""
+                classification_source = "none"
+                logger.warning(f"Body empty/short AND attachment extraction failed for {message_id} - routing to manual_review")
+
+        # PATH 3: short/empty body + no attachments → manual_review
+        else:
+            body_for_classification = ""
+            classification_source = "none"
+            logger.warning(f"No meaningful body and no attachments for {message_id} - routing to manual_review")
+
+        # Gate: if we have nothing, skip model and route directly to manual_review
+        if not (body_for_classification or "").strip():
+            logger.info(f"No classification input for {message_id} - storing as manual_review")
+
+            email_data = {
+                "message_id": message_id,
+                "sender": sender,
+                "sender_name": sender_name,
+                "recipient": recipient,
+                "subject": subject,
+                "body": clean_body,  # Original body (may be empty)
+                "received_at": received,
+                "has_attachments": has_attachments,
+                "source_account": source_account,
+                "conversation_id": conversation_id,
+                "receiver_type": receiver_type,
+                "cc": cc_string,
+                "debtor_number": "",
+                "event_type": "manual_review",
+                "target_folder": "manual_review",
+                "reply_sent": "no_response",
+                "new_contact_email": "",
+                "new_contact_phone": "",
+                "contact_status": "active",
+                "cleaned_body": "",
+                "debtor_id": None,
+                "classification": "manual_review",
+                "prediction": "manual_review",
+                "response": "",
+                "response_sent": False,
+                "draft_created": False,
+                "draft_id": None,
+                "invoices_attached": False,
+                "invoice_count": 0,
+                "attachments_processed_count": 0,
+                "batch_id": self.batch_id,
+                "data_source": data_source,
+                "had_threads": had_threads,
+                "classification_source": classification_source,
+                "processed_at": datetime.utcnow().isoformat(),
+                "batch_complete": False
+            }
+
+            if self.mongo:
+                self.mongo.insert_email(email_data)
+
+            # Still move to folder and mark read
+            folder_mapping = self.folder_mappings.get(source_account, {})
+            folder_id = folder_mapping.get("manual_review")
+            if folder_id:
+                try:
+                    self.graph_client.move_email_to_folder(message_id, folder_id, source_account)
+                    self.graph_client.mark_email_read(message_id, source_account, is_read=True)
+                except Exception as e:
+                    logger.warning(f"Failed to move/mark email {message_id}: {e}")
+
+            return True  # Processed successfully, routed to manual_review
+
+        else:
+            # Log metadata only (no PII/sensitive content)
+            body_length = len(body_for_classification)
+            logger.info(
+                f"Sending to model API: body_length={body_length}, "
+                f"classification_source={classification_source}, has_attachments={has_attachments}"
+            )
+            if "--- ATTACHMENT CONTENT ---" in body_for_classification:
+                logger.info("✅ Attachment content included in body for model classification")
+
+            model_response = self.model_api.process_email_complete(
+                subject=subject,
+                body=body_for_classification,
+                headers=headers,
+                sender_email=sender,
+                recipient_emails=recipient_emails,
+                has_attachments=has_attachments,  # Enhanced detection included
+                had_threads=had_threads
+            )
         
         # CHECK UNIFIED STOP AFTER MODEL API CALL
         if self.stop_event.is_set():
@@ -1534,6 +1563,9 @@ class EmailProcessor:
             "invoices_attached": invoices_attached,
             "invoice_count": invoice_count,
             "attachments_processed_count": attachments_processed_count,  # Number of attachments successfully processed/extracted
+            "classification_source": classification_source,
+            "body_char_count": len(body_text_clean) if body_is_meaningful else 0,
+            "attachment_char_count": len(attachment_content) if classification_source == "attachment" else 0,
             "batch_id": self.batch_id,
             "data_source": data_source,
             "had_threads": had_threads,
