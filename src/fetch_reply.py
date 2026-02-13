@@ -272,49 +272,6 @@ def extract_clean_email_content(msg):
     unique_body = msg.get("uniqueBody", {})
     full_body = msg.get("body", {})
 
-    def _count_non_ascii(text: str) -> int:
-        return sum(1 for c in (text or "") if ord(c) > 127)
-
-    def _count_vietnamese_chars(text: str) -> int:
-        """
-        Approx Vietnamese detection: count common Vietnamese-specific letters/diacritics.
-        Used only to avoid dropping Vietnamese when choosing uniqueBody vs body.
-        """
-        if not text:
-            return 0
-        vietnamese_letters = set(
-            "đĐ"
-            "ăĂâÂêÊôÔơƠưƯ"
-            "áàảãạÁÀẢÃẠ"
-            "ấầẩẫậẤẦẨẪẬ"
-            "ắằẳẵặẮẰẲẴẶ"
-            "éèẻẽẹÉÈẺẼẸ"
-            "ếềểễệẾỀỂỄỆ"
-            "íìỉĩịÍÌỈĨỊ"
-            "óòỏõọÓÒỎÕỌ"
-            "ốồổỗộỐỒỔỖỘ"
-            "ớờởỡợỚỜỞỠỢ"
-            "úùủũụÚÙỦŨỤ"
-            "ứừửữựỨỪỬỮỰ"
-            "ýỳỷỹỵÝỲỶỸỴ"
-        )
-        return sum(1 for c in text if c in vietnamese_letters)
-
-    def _score_body_candidate(text: str) -> int:
-        """
-        Score a candidate body so we prefer preserving language (e.g., Vietnamese) over
-        "shortest/newest wins" behavior.
-
-        Mirrors the idea used in testing_client/test.py:
-        - Vietnamese chars dominate
-        - then non-ascii density
-        - then length
-        """
-        vn = _count_vietnamese_chars(text or "")
-        na = _count_non_ascii(text or "")
-        ln = len(text or "")
-        return vn * 1_000_000 + na * 1_000 + ln
-
     def _body_obj_to_text(body_obj: Dict[str, Any]) -> Tuple[str, str]:
         """
         Convert Graph body object to plain text consistently for scoring/comparison.
@@ -1131,6 +1088,8 @@ class EmailProcessor:
                 "data_source": data_source,
                 "had_threads": had_threads,
                 "classification_source": classification_source,
+                "body_char_count": len(clean_body or ""),
+                "attachment_char_count": len(attachment_content or ""),
                 "processed_at": datetime.utcnow().isoformat(),
                 "batch_complete": False
             }
@@ -1143,8 +1102,9 @@ class EmailProcessor:
             folder_id = folder_mapping.get("manual_review")
             if folder_id:
                 try:
-                    self.graph_client.move_email_to_folder(message_id, folder_id, source_account)
-                    self.graph_client.mark_email_read(message_id, source_account, is_read=True)
+                    success, new_id = self.graph_client.move_email_to_folder(message_id, folder_id, source_account)
+                    msg_id_for_read = new_id if (success and new_id) else message_id
+                    self.graph_client.mark_email_read(msg_id_for_read, source_account, is_read=True)
                 except Exception as e:
                     logger.warning(f"Failed to move/mark email {message_id}: {e}")
 
@@ -1157,8 +1117,6 @@ class EmailProcessor:
                 f"Sending to model API: body_length={body_length}, "
                 f"classification_source={classification_source}, has_attachments={has_attachments}"
             )
-            if "--- ATTACHMENT CONTENT ---" in body_for_classification:
-                logger.info("✅ Attachment content included in body for model classification")
 
             model_response = self.model_api.process_email_complete(
                 subject=subject,
