@@ -41,7 +41,7 @@ load_dotenv()
 # ============================================================================
 # Config: env vars with hardcoded fallbacks (no Kubernetes/GCP config access)
 # ============================================================================
-INVOICE_HANDLER_ENABLED = False
+INVOICE_HANDLER_ENABLED = True
 
 # VDI file_mover URL - POST /retrieve-document; fallback when env not set
 VDI_URL = (os.getenv("VDI_URL") or os.getenv("INVOICE_FETCH_URL") or "").strip() or "http://20.102.88.158:5000/retrieve-document"
