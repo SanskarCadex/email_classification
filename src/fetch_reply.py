@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 from src.db import get_mongo, PostgresHelper
 from src.log_config import logger
 from src.doc_handler import get_formatted_attachment_content_for_classification
-from src.invoice_handler import InvoiceHandler
+from src.invoice_handler import InvoiceHandler, extract_invoice_numbers_from_text
 
 load_dotenv()
 
@@ -59,7 +59,7 @@ ALLOWED_LABELS = [
     "uncategorised"
 ]
 # Labels that should receive responses
-# NOTE:
+#NOTE: This is the list of labels that will be used to generate replies.
 # - Classification event_type will be "invoice_request_no_info" or "claims_paid_no_proof".
 # - "invoice_request_acknowledgment" is included so ModelAPIClient.generate_reply()
 #   is allowed to call /generate_reply for the ACK template, even though it is
@@ -271,49 +271,6 @@ def extract_clean_email_content(msg):
     # Get both uniqueBody and fullBody
     unique_body = msg.get("uniqueBody", {})
     full_body = msg.get("body", {})
-
-    def _count_non_ascii(text: str) -> int:
-        return sum(1 for c in (text or "") if ord(c) > 127)
-
-    def _count_vietnamese_chars(text: str) -> int:
-        """
-        Approx Vietnamese detection: count common Vietnamese-specific letters/diacritics.
-        Used only to avoid dropping Vietnamese when choosing uniqueBody vs body.
-        """
-        if not text:
-            return 0
-        vietnamese_letters = set(
-            "đĐ"
-            "ăĂâÂêÊôÔơƠưƯ"
-            "áàảãạÁÀẢÃẠ"
-            "ấầẩẫậẤẦẨẪẬ"
-            "ắằẳẵặẮẰẲẴẶ"
-            "éèẻẽẹÉÈẺẼẸ"
-            "ếềểễệẾỀỂỄỆ"
-            "íìỉĩịÍÌỈĨỊ"
-            "óòỏõọÓÒỎÕỌ"
-            "ốồổỗộỐỒỔỖỘ"
-            "ớờởỡợỚỜỞỠỢ"
-            "úùủũụÚÙỦŨỤ"
-            "ứừửữựỨỪỬỮỰ"
-            "ýỳỷỹỵÝỲỶỸỴ"
-        )
-        return sum(1 for c in text if c in vietnamese_letters)
-
-    def _score_body_candidate(text: str) -> int:
-        """
-        Score a candidate body so we prefer preserving language (e.g., Vietnamese) over
-        "shortest/newest wins" behavior.
-
-        Mirrors the idea used in testing_client/test.py:
-        - Vietnamese chars dominate
-        - then non-ascii density
-        - then length
-        """
-        vn = _count_vietnamese_chars(text or "")
-        na = _count_non_ascii(text or "")
-        ln = len(text or "")
-        return vn * 1_000_000 + na * 1_000 + ln
 
     def _body_obj_to_text(body_obj: Dict[str, Any]) -> Tuple[str, str]:
         """
@@ -998,6 +955,9 @@ class EmailProcessor:
         # Extract clean content
         clean_body, data_source, had_threads = extract_clean_email_content(msg)
         
+        # Extract invoice numbers from thread mail (for invoice puller - prefer over model if found)
+        extracted_invoice_numbers = extract_invoice_numbers_from_text(clean_body or "")
+        
         # Extract recipients  
         to_recipients = msg.get("toRecipients", [])
         recipient = ""
@@ -1131,6 +1091,8 @@ class EmailProcessor:
                 "data_source": data_source,
                 "had_threads": had_threads,
                 "classification_source": classification_source,
+                "body_char_count": len(clean_body or ""),
+                "attachment_char_count": len(attachment_content or ""),
                 "processed_at": datetime.utcnow().isoformat(),
                 "batch_complete": False
             }
@@ -1143,8 +1105,9 @@ class EmailProcessor:
             folder_id = folder_mapping.get("manual_review")
             if folder_id:
                 try:
-                    self.graph_client.move_email_to_folder(message_id, folder_id, source_account)
-                    self.graph_client.mark_email_read(message_id, source_account, is_read=True)
+                    success, new_id = self.graph_client.move_email_to_folder(message_id, folder_id, source_account)
+                    msg_id_for_read = new_id if (success and new_id) else message_id
+                    self.graph_client.mark_email_read(msg_id_for_read, source_account, is_read=True)
                 except Exception as e:
                     logger.warning(f"Failed to move/mark email {message_id}: {e}")
 
@@ -1157,8 +1120,6 @@ class EmailProcessor:
                 f"Sending to model API: body_length={body_length}, "
                 f"classification_source={classification_source}, has_attachments={has_attachments}"
             )
-            if "--- ATTACHMENT CONTENT ---" in body_for_classification:
-                logger.info("✅ Attachment content included in body for model classification")
 
             model_response = self.model_api.process_email_complete(
                 subject=subject,
@@ -1377,21 +1338,43 @@ class EmailProcessor:
                                 temp_dir = None
                                 try:
                                     if company_name and debtor_number:
+                                        # Prefer invoice numbers extracted from thread mail; else use model's
+                                        invoice_number_for_fetch = (
+                                            extracted_invoice_numbers[0] if extracted_invoice_numbers
+                                            else invoice_number or None
+                                        )
+                                        if extracted_invoice_numbers:
+                                            logger.info(f"Using invoice number(s) from thread: {extracted_invoice_numbers}")
                                         fetch_result = self.invoice_handler.fetch_invoices(
                                             company_name=company_name,
                                             abcfn_number=debtor_number,
-                                            invoice_number=invoice_number or None
+                                            invoice_number=invoice_number_for_fetch
                                         )
-                                        if fetch_result.success and fetch_result.content and fetch_result.filename:
+                                        if fetch_result.success and (
+                                            fetch_result.content_files or (fetch_result.content and fetch_result.filename)
+                                        ):
                                             temp_dir = tempfile.mkdtemp(prefix="invoice_")
-                                            safe_name = os.path.basename(fetch_result.filename)
-                                            if safe_name in ("", ".", ".."):
-                                                safe_name = "invoice_file"
-                                            invoice_path = os.path.join(temp_dir, safe_name)
-                                            with open(invoice_path, "wb") as f:
-                                                f.write(fetch_result.content)
-                                            invoice_file_paths = [invoice_path]
-                                            logger.info(f"Invoice file prepared for attachment: {fetch_result.filename} ({len(fetch_result.content)} bytes)")
+                                            if fetch_result.content_files:
+                                                # <= 5 files: attach each individually
+                                                for idx, (fname, fbytes) in enumerate(fetch_result.content_files):
+                                                    safe_name = os.path.basename(fname) or f"invoice_{idx}"
+                                                    if safe_name in ("", ".", ".."):
+                                                        safe_name = f"invoice_{idx}"
+                                                    invoice_path = os.path.join(temp_dir, safe_name)
+                                                    with open(invoice_path, "wb") as f:
+                                                        f.write(fbytes)
+                                                    invoice_file_paths.append(invoice_path)
+                                                logger.info(f"Invoice files prepared for attachment: {len(invoice_file_paths)} file(s)")
+                                            else:
+                                                # > 5 files or single file: attach ZIP/single file
+                                                safe_name = os.path.basename(fetch_result.filename)
+                                                if safe_name in ("", ".", ".."):
+                                                    safe_name = "invoice_file"
+                                                invoice_path = os.path.join(temp_dir, safe_name)
+                                                with open(invoice_path, "wb") as f:
+                                                    f.write(fetch_result.content)
+                                                invoice_file_paths = [invoice_path]
+                                                logger.info(f"Invoice file prepared for attachment: {fetch_result.filename} ({len(fetch_result.content)} bytes)")
                                         else:
                                             logger.info(f"Invoice fetch skipped/failed (non-blocking): {fetch_result.error}")
                                     else:

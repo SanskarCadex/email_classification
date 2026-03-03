@@ -1,30 +1,31 @@
 """
-Invoice handler: talks to the VM / VDI invoice fetch service.
+Invoice handler: talks to the file_mover (VDI) document retrieval service.
 
 Responsibilities:
 - Build the request payload from company / ABCFN / optional invoice number.
-- Call the VM API (fetch-invoices) whose URL comes from .env.
+- Call the VDI file_mover at POST /retrieve-document.
 - Handle responses:
-    - On success: return file bytes, filename, mime_type and request metadata.
+    - On success: return file bytes or list of files, filename(s), mime_type.
     - On error (JSON from API): return structured error for caller to decide.
 
 NOTE:
 - ABCFN numbers may come with or without a leading underscore.
-- The external contract we aim for is:
-    - Our pipeline can pass either form.
-    - This handler always sends the *normalized* form (without leading "_")
-      to the VM API, which can handle mapping to the underlying folder.
+- file_mover returns AES-encrypted ZIP; we decrypt it.
+- If ZIP has <= 5 files: attach each file individually to the email.
+- If ZIP has > 5 files: re-zip without password and attach the ZIP.
+- VDI_URL points to file_mover (e.g. http://20.102.88.158:5000/retrieve-document).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import io
 
 import pyzipper
@@ -38,45 +39,104 @@ load_dotenv()
 
 
 # ============================================================================
-# HARDCODED FLAG: Set to False to completely disable invoice handler
+# HARDCODED: No Kubernetes/GCP config access - values hardcoded in code
 # ============================================================================
-# This flag is hardcoded in the file to allow quick disable without env changes
-# When False, all invoice handler methods will return early without processing
-INVOICE_HANDLER_ENABLED = False  # Set to False to disable entire invoice handler
+# Set to False to completely disable invoice handler (single hardcoded switch)
+INVOICE_HANDLER_ENABLED = False
 
-# URL of the VM invoice fetch API (Docker service on the VM)
-# Example: http://34.170.59.164:5001/fetch-invoices
-INVOICE_FETCH_URL = os.getenv("INVOICE_FETCH_URL")
+# VDI file_mover URL - POST /retrieve-document (company_name, abcfn_number, invoice_number)
+# Hardcoded because prod config access is not available
+VDI_URL = "http://20.102.88.158:5000/retrieve-document"
+# Legacy fetch URL now directly mapped to VDI_URL
+INVOICE_FETCH_URL = VDI_URL
 
-# Enable/disable invoice handler via environment variable (default: false)
-# This works in conjunction with INVOICE_HANDLER_ENABLED flag above
-ENABLE_INVOICE_HANDLER = os.getenv("ENABLE_INVOICE_HANDLER", "false").lower() == "true"
+# Password used by file_mover to encrypt ZIP; we decrypt with same password
+# Hardcoded to match file_mover ZIP_PASSWORD
+ZIP_PASSWORD = "abccollect".encode("utf-8")
 
-# Password used by VDI to decrypt the AES-encrypted ZIP
-# Must be set via .env for security (no hardcoded default)
-ZIP_PASSWORD = os.getenv("ZIP_PASSWORD", "").encode("utf-8")
+# If ZIP contains <= this many files, attach each file individually; otherwise re-zip and attach ZIP
+MAX_FILES_ATTACH_INDIVIDUALLY = 5
 
-# Check if handler should be enabled (both flags must be True)
-HANDLER_ACTIVE = INVOICE_HANDLER_ENABLED and ENABLE_INVOICE_HANDLER
-
-if HANDLER_ACTIVE and not ZIP_PASSWORD:
+# Check if handler should be enabled (single flag)
+if INVOICE_HANDLER_ENABLED and not ZIP_PASSWORD:
     logger.warning(
         "ZIP_PASSWORD not set in environment; "
         "encrypted ZIPs will fail to decrypt."
     )
 
-if not INVOICE_HANDLER_ENABLED:
-    logger.info(
-        "Invoice handler is DISABLED by hardcoded flag INVOICE_HANDLER_ENABLED=False. "
-        "Set INVOICE_HANDLER_ENABLED = True in invoice_handler.py to enable."
-    )
-
 if not INVOICE_FETCH_URL:
     logger.warning(
-        "INVOICE_FETCH_URL not set in environment; "
-        "invoice_handler will be disabled until configured."
+        "VDI_URL/INVOICE_FETCH_URL not set; invoice_handler will be disabled until configured."
     )
 
+
+def _is_url_or_link(token: str) -> bool:
+    """Return True if the token looks like a URL or link, not an invoice number."""
+    if not token or len(token) < 2:
+        return False
+    t = token.strip().lower()
+    if t.startswith("["):
+        t = t[1:]
+    if t.endswith("]"):
+        t = t[:-1]
+    return (
+        t.startswith("http://")
+        or t.startswith("https://")
+        or t.startswith("http:")
+        or "://" in t
+        or (t.startswith("www.") and "." in t[4:])
+        or ("?" in t and "=" in t and "." in t)
+    )
+
+
+def extract_invoice_numbers_from_text(text: str) -> List[str]:
+    """
+    Try to extract invoice number(s) from the given email text.
+    This is independent of classification and only focuses on parsing the body text.
+    Excludes URLs and links (e.g. Salesforce, image servers) that may contain digits.
+    """
+    if not text:
+        return []
+
+    lines = text.splitlines()
+    invoice_numbers: List[str] = []
+
+    # Strategy 1: Look for the common "Inv#" table pattern and then read the
+    # following data lines, capturing the first token on each row as the invoice
+    # number (e.g. "1-136279281556" or "24550741").
+    for idx, line in enumerate(lines):
+        if "Inv#" in line:
+            for j in range(idx + 1, min(idx + 15, len(lines))):
+                candidate = lines[j].strip()
+                if not candidate:
+                    continue
+                if not re.search(r"\d", candidate):
+                    if invoice_numbers:
+                        break
+                    continue
+
+                parts = candidate.split()
+                if not parts:
+                    continue
+                first_token = parts[0]
+                # Require at least 5 digits and exclude URL-like tokens
+                if re.search(r"\d{5,}", first_token) and not _is_url_or_link(first_token):
+                    if first_token not in invoice_numbers:
+                        invoice_numbers.append(first_token)
+            if invoice_numbers:
+                break
+
+    # Strategy 2: Look for sentences like "invoice number is 2004004015" or "invoice # 2004004015"
+    pattern = re.compile(
+        r"invoice\s*(?:number|#)\s*(?:is|:)?\s*([A-Za-z0-9\-]+)",
+        re.IGNORECASE,
+    )
+    for m in pattern.finditer(text):
+        val = m.group(1)
+        if val and val not in invoice_numbers and not _is_url_or_link(val):
+            invoice_numbers.append(val)
+
+    return invoice_numbers
 
 
 @dataclass
@@ -85,6 +145,8 @@ class InvoiceFetchResult:
     filename: Optional[str] = None
     mime_type: Optional[str] = None
     content: Optional[bytes] = None
+    # When ZIP has <= MAX_FILES_ATTACH_INDIVIDUALLY files: list of (filename, bytes) for each file
+    content_files: Optional[List[Tuple[str, bytes]]] = None
     error: Optional[str] = None
     details: Optional[Any] = None
     request_payload: Optional[Dict[str, Any]] = None
@@ -93,17 +155,17 @@ class InvoiceFetchResult:
 
 class InvoiceHandler:
     """
-    Simple client for the VM /fetch-invoices endpoint.
+    Client for the VDI file_mover /retrieve-document endpoint.
 
-    This module is intentionally decoupled from email sending:
-    callers (e.g. fetch_reply.py) can use it to fetch files and then
-    decide whether to draft or send the second invoice email.
+    Sends POST with {company_name, abcfn_number, invoice_number?}.
+    Receives encrypted ZIP, decrypts it. If <= 5 files, returns each for individual
+    attachment; if > 5 files, re-zips without password. Callers attach to draft emails.
     """
 
     def __init__(
         self,
         base_url: Optional[str] = None,
-        timeout: int = 60,
+        timeout: int = 180,
         session: Optional[requests.Session] = None,
     ):
         # Check hardcoded flag first
@@ -119,8 +181,8 @@ class InvoiceHandler:
 
         if not self.base_url and INVOICE_HANDLER_ENABLED:
             logger.error(
-                "InvoiceHandler initialised without INVOICE_FETCH_URL. "
-                "Set INVOICE_FETCH_URL in your .env file."
+                "InvoiceHandler initialised without VDI_URL/INVOICE_FETCH_URL. "
+                "Set VDI_URL in your .env or it will use hardcoded default."
             )
 
     @staticmethod
@@ -141,33 +203,32 @@ class InvoiceHandler:
             return abcfn_number[1:]
         return abcfn_number
 
-    def _decrypt_and_rezip(self, encrypted_zip_bytes: bytes) -> bytes:
+    def _process_encrypted_zip(
+        self, encrypted_zip_bytes: bytes
+    ) -> Tuple[str, Any]:
         """
-        Decrypt the password-protected ZIP and re-zip without password.
-        
-        Flow:
-        1. Decrypt AES-encrypted ZIP using pyzipper
-        2. Extract all files to temp directory
-        3. Re-zip without password using standard zipfile
-        4. Return unencrypted ZIP bytes
-        
+        Decrypt the password-protected ZIP, then either attach files individually or re-zip.
+
+        - If ZIP contains <= MAX_FILES_ATTACH_INDIVIDUALLY files: return ("files", [(filename, bytes), ...])
+        - If ZIP contains > MAX_FILES_ATTACH_INDIVIDUALLY files: return ("zip", unencrypted_zip_bytes)
+
         Args:
             encrypted_zip_bytes: Password-protected ZIP file bytes
-            
+
         Returns:
-            Unencrypted ZIP file bytes
-            
+            ("files", list of (filename, bytes)) or ("zip", zip_bytes)
+
         Raises:
-            Exception: If decryption or re-zipping fails
+            Exception: If decryption fails
         """
         temp_extract_dir = None
         temp_zip_path = None
-        
+
         try:
             # Step 1: Decrypt and extract ZIP
             temp_extract_dir = tempfile.mkdtemp(prefix="invoice_extract_")
             logger.info(f"Decrypting ZIP ({len(encrypted_zip_bytes)} bytes) to {temp_extract_dir}")
-            
+
             with pyzipper.AESZipFile(
                 io.BytesIO(encrypted_zip_bytes),
                 "r",
@@ -176,43 +237,62 @@ class InvoiceHandler:
             ) as zf:
                 zf.setpassword(ZIP_PASSWORD)
                 zf.extractall(path=temp_extract_dir)
-            
+
             logger.info(f"Successfully decrypted and extracted ZIP to {temp_extract_dir}")
-            
-            # Step 2: Re-zip without password
+
+            # Step 2: Collect all files (relative paths)
+            all_files: List[Tuple[str, str]] = []  # (arcname, full_path)
+            for root, _dirs, files in os.walk(temp_extract_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, temp_extract_dir)
+                    all_files.append((arcname, file_path))
+
+            file_count = len(all_files)
+            logger.info(f"ZIP contains {file_count} file(s) (threshold: {MAX_FILES_ATTACH_INDIVIDUALLY})")
+
+            if file_count == 0:
+                # Empty ZIP: do not attach anything to the email
+                logger.info("ZIP is empty - nothing to attach")
+                return ("empty", None)
+
+            if file_count <= MAX_FILES_ATTACH_INDIVIDUALLY:
+                # Attach each file individually (no re-zipping)
+                content_files: List[Tuple[str, bytes]] = []
+                for arcname, file_path in all_files:
+                    # Use arcname with path separators replaced to avoid overwriting same basenames
+                    safe_fname = arcname.replace("/", "_").replace("\\", "_") or "invoice"
+                    with open(file_path, "rb") as f:
+                        content_files.append((safe_fname, f.read()))
+                logger.info(f"Returning {len(content_files)} file(s) for individual attachment")
+                return ("files", content_files)
+
+            # Step 3: Re-zip without password (> 5 files)
             temp_zip_path = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
             temp_zip_path.close()
-            
-            logger.info(f"Re-zipping extracted files to {temp_zip_path.name} (no password)")
-            
+
+            logger.info(f"Re-zipping {file_count} file(s) (no password)")
+
             with zipfile.ZipFile(temp_zip_path.name, "w", zipfile.ZIP_DEFLATED) as zf:
-                # Walk through extracted directory and add all files
-                for root, _dirs, files in os.walk(temp_extract_dir):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        # Calculate relative path from extract directory
-                        arcname = os.path.relpath(file_path, temp_extract_dir)
-                        zf.write(file_path, arcname)
-            
-            # Step 3: Read the unencrypted ZIP bytes
+                for arcname, file_path in all_files:
+                    zf.write(file_path, arcname)
+
             with open(temp_zip_path.name, "rb") as f:
                 unencrypted_zip_bytes = f.read()
-            
+
             logger.info(f"Successfully created unencrypted ZIP ({len(unencrypted_zip_bytes)} bytes)")
-            
-            return unencrypted_zip_bytes
-            
+            return ("zip", unencrypted_zip_bytes)
+
         except Exception as e:
-            logger.error(f"Failed to decrypt/re-zip: {e}", exc_info=True)
+            logger.error(f"Failed to decrypt/process ZIP: {e}", exc_info=True)
             raise
         finally:
-            # Cleanup temp files
             if temp_extract_dir and os.path.exists(temp_extract_dir):
                 try:
                     shutil.rmtree(temp_extract_dir)
                 except Exception as cleanup_err:
                     logger.warning(f"Failed to cleanup extract dir: {cleanup_err}")
-            
+
             if temp_zip_path and os.path.exists(temp_zip_path.name):
                 try:
                     os.remove(temp_zip_path.name)
@@ -259,24 +339,14 @@ class InvoiceHandler:
             "invoice_number": "***" if invoice_number else None,
         }
 
-        # Global kill switch: check hardcoded flag first, then env flag
-        # When disabled, we do NOT call the VM and simply return a disabled result.
-        if not HANDLER_ACTIVE:
-            if not INVOICE_HANDLER_ENABLED:
-                logger.info(
-                    "InvoiceHandler is disabled by hardcoded flag INVOICE_HANDLER_ENABLED=False; "
-                    "skipping invoice fetch."
-                )
-                error_msg = "Invoice handler disabled by hardcoded flag"
-            elif not ENABLE_INVOICE_HANDLER:
-                logger.info(
-                    "InvoiceHandler is disabled by ENABLE_INVOICE_HANDLER env flag; "
-                    "skipping invoice fetch."
-                )
-                error_msg = "Invoice handler disabled by environment configuration"
-            else:
-                error_msg = "Invoice handler disabled"
-            
+        # Global kill switch: when disabled, we do NOT call the VM and simply return a disabled result.
+        if not INVOICE_HANDLER_ENABLED:
+            logger.info(
+                "InvoiceHandler is disabled by hardcoded flag INVOICE_HANDLER_ENABLED=False; "
+                "skipping invoice fetch."
+            )
+            error_msg = "Invoice handler disabled by hardcoded flag"
+
             return InvoiceFetchResult(
                 success=False,
                 error=error_msg,
@@ -288,7 +358,7 @@ class InvoiceHandler:
         if not self.base_url:
             return InvoiceFetchResult(
                 success=False,
-                error="INVOICE_FETCH_URL is not configured",
+                error="VDI_URL/INVOICE_FETCH_URL is not configured",
             )
 
         payload = self._build_payload(company_name, abcfn_number, invoice_number)
@@ -389,14 +459,38 @@ class InvoiceHandler:
             if ".zip" in disposition.lower():
                 is_zip = True
         
-        # If it's a ZIP file, decrypt and re-zip without password
+        # If it's a ZIP file, decrypt and process (attach individually if <=5 files, else re-zip)
         if is_zip:
             try:
-                logger.info("Received encrypted ZIP, decrypting and re-zipping without password...")
-                file_bytes = self._decrypt_and_rezip(file_bytes)
+                logger.info("Received encrypted ZIP, decrypting and processing...")
+                result_type, result_data = self._process_encrypted_zip(file_bytes)
+                if result_type == "empty":
+                    # Empty ZIP: nothing to attach
+                    return InvoiceFetchResult(
+                        success=True,
+                        filename=None,
+                        mime_type=content_type or "application/octet-stream",
+                        content=None,
+                        content_files=None,
+                        request_payload=redacted_payload,
+                        status_code=resp.status_code,
+                    )
+                if result_type == "files":
+                    # <= 5 files: return for individual attachment
+                    return InvoiceFetchResult(
+                        success=True,
+                        filename=None,
+                        mime_type=content_type or "application/octet-stream",
+                        content=None,
+                        content_files=result_data,
+                        request_payload=redacted_payload,
+                        status_code=resp.status_code,
+                    )
+                # > 5 files: re-zipped bytes
+                file_bytes = result_data
                 logger.info("Successfully decrypted and re-zipped invoice file")
             except Exception as e:
-                logger.error(f"Failed to decrypt/re-zip invoice file: {e}", exc_info=True)
+                logger.error(f"Failed to decrypt/process invoice ZIP: {e}", exc_info=True)
                 return InvoiceFetchResult(
                     success=False,
                     error=f"Failed to decrypt invoice ZIP: {str(e)}",
@@ -463,6 +557,6 @@ class InvoiceHandler:
         )
 
 
-__all__ = ["InvoiceFetchResult", "InvoiceHandler"]
+__all__ = ["InvoiceFetchResult", "InvoiceHandler", "extract_invoice_numbers_from_text"]
 
 
