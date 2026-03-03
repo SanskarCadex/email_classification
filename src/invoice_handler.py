@@ -39,20 +39,17 @@ load_dotenv()
 
 
 # ============================================================================
-# HARDCODED: No Kubernetes/GCP config access - values hardcoded in code
+# Config: env vars with hardcoded fallbacks (no Kubernetes/GCP config access)
 # ============================================================================
-# Set to False to completely disable invoice handler (single hardcoded switch)
 INVOICE_HANDLER_ENABLED = False
 
-# VDI file_mover URL - POST /retrieve-document (company_name, abcfn_number, invoice_number)
-# Hardcoded because prod config access is not available
-VDI_URL = "http://20.102.88.158:5000/retrieve-document"
-# Legacy fetch URL now directly mapped to VDI_URL
+# VDI file_mover URL - POST /retrieve-document; fallback when env not set
+VDI_URL = (os.getenv("VDI_URL") or os.getenv("INVOICE_FETCH_URL") or "").strip() or "http://20.102.88.158:5000/retrieve-document"
 INVOICE_FETCH_URL = VDI_URL
 
-# Password used by file_mover to encrypt ZIP; we decrypt with same password
-# Hardcoded to match file_mover ZIP_PASSWORD
-ZIP_PASSWORD = "abccollect".encode("utf-8")
+# Password used by file_mover to encrypt ZIP; fallback when env not set
+_zip_password = os.getenv("ZIP_PASSWORD", "abccollect")
+ZIP_PASSWORD = _zip_password.encode("utf-8") if _zip_password else b""
 
 # If ZIP contains <= this many files, attach each file individually; otherwise re-zip and attach ZIP
 MAX_FILES_ATTACH_INDIVIDUALLY = 5
@@ -127,13 +124,21 @@ def extract_invoice_numbers_from_text(text: str) -> List[str]:
                 break
 
     # Strategy 2: Look for sentences like "invoice number is 2004004015" or "invoice # 2004004015"
+    # Enforce same minimum-digit validation as Strategy 1 (>= 5 digits)
+    MIN_INVOICE_DIGITS = 5
     pattern = re.compile(
         r"invoice\s*(?:number|#)\s*(?:is|:)?\s*([A-Za-z0-9\-]+)",
         re.IGNORECASE,
     )
     for m in pattern.finditer(text):
         val = m.group(1)
-        if val and val not in invoice_numbers and not _is_url_or_link(val):
+        digit_count = len(re.findall(r"\d", val or ""))
+        if (
+            val
+            and digit_count >= MIN_INVOICE_DIGITS
+            and val not in invoice_numbers
+            and not _is_url_or_link(val)
+        ):
             invoice_numbers.append(val)
 
     return invoice_numbers

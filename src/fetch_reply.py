@@ -1338,19 +1338,35 @@ class EmailProcessor:
                                 temp_dir = None
                                 try:
                                     if company_name and debtor_number:
-                                        # Prefer invoice numbers extracted from thread mail; else use model's
-                                        invoice_number_for_fetch = (
-                                            extracted_invoice_numbers[0] if extracted_invoice_numbers
-                                            else invoice_number or None
-                                        )
+                                        # Build candidates: thread-extracted first, then model's; try each until success
+                                        candidates: List[Optional[str]] = []
                                         if extracted_invoice_numbers:
-                                            logger.info(f"Using invoice number(s) from thread: {extracted_invoice_numbers}")
-                                        fetch_result = self.invoice_handler.fetch_invoices(
-                                            company_name=company_name,
-                                            abcfn_number=debtor_number,
-                                            invoice_number=invoice_number_for_fetch
-                                        )
-                                        if fetch_result.success and (
+                                            candidates.extend(extracted_invoice_numbers)
+                                        if invoice_number and invoice_number not in candidates:
+                                            candidates.append(invoice_number)
+                                        if not candidates:
+                                            candidates.append(None)
+
+                                        fetch_result = None
+                                        for idx, candidate in enumerate(candidates):
+                                            fetch_result = self.invoice_handler.fetch_invoices(
+                                                company_name=company_name,
+                                                abcfn_number=debtor_number,
+                                                invoice_number=candidate,
+                                            )
+                                            if fetch_result.success and (
+                                                fetch_result.content_files or (fetch_result.content and fetch_result.filename)
+                                            ):
+                                                if extracted_invoice_numbers and idx == 0:
+                                                    logger.info(
+                                                        "Using %d invoice number(s) extracted from thread",
+                                                        len(extracted_invoice_numbers),
+                                                    )
+                                                break
+                                            if idx < len(candidates) - 1:
+                                                logger.info("Invoice fetch candidate failed; trying next candidate")
+
+                                        if fetch_result and fetch_result.success and (
                                             fetch_result.content_files or (fetch_result.content and fetch_result.filename)
                                         ):
                                             temp_dir = tempfile.mkdtemp(prefix="invoice_")
