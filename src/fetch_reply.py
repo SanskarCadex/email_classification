@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 from src.db import get_mongo, PostgresHelper
 from src.log_config import logger
 from src.doc_handler import get_formatted_attachment_content_for_classification
-from src.invoice_handler import InvoiceHandler
+from src.invoice_handler import InvoiceHandler, extract_invoice_numbers_from_text
 
 load_dotenv()
 
@@ -59,7 +59,7 @@ ALLOWED_LABELS = [
     "uncategorised"
 ]
 # Labels that should receive responses
-# NOTE:
+#NOTE: This is the list of labels that will be used to generate replies.
 # - Classification event_type will be "invoice_request_no_info" or "claims_paid_no_proof".
 # - "invoice_request_acknowledgment" is included so ModelAPIClient.generate_reply()
 #   is allowed to call /generate_reply for the ACK template, even though it is
@@ -955,6 +955,9 @@ class EmailProcessor:
         # Extract clean content
         clean_body, data_source, had_threads = extract_clean_email_content(msg)
         
+        # Extract invoice numbers from thread mail (for invoice puller - prefer over model if found)
+        extracted_invoice_numbers = extract_invoice_numbers_from_text(clean_body or "")
+        
         # Extract recipients  
         to_recipients = msg.get("toRecipients", [])
         recipient = ""
@@ -1335,21 +1338,43 @@ class EmailProcessor:
                                 temp_dir = None
                                 try:
                                     if company_name and debtor_number:
+                                        # Prefer invoice numbers extracted from thread mail; else use model's
+                                        invoice_number_for_fetch = (
+                                            extracted_invoice_numbers[0] if extracted_invoice_numbers
+                                            else invoice_number or None
+                                        )
+                                        if extracted_invoice_numbers:
+                                            logger.info(f"Using invoice number(s) from thread: {extracted_invoice_numbers}")
                                         fetch_result = self.invoice_handler.fetch_invoices(
                                             company_name=company_name,
                                             abcfn_number=debtor_number,
-                                            invoice_number=invoice_number or None
+                                            invoice_number=invoice_number_for_fetch
                                         )
-                                        if fetch_result.success and fetch_result.content and fetch_result.filename:
+                                        if fetch_result.success and (
+                                            fetch_result.content_files or (fetch_result.content and fetch_result.filename)
+                                        ):
                                             temp_dir = tempfile.mkdtemp(prefix="invoice_")
-                                            safe_name = os.path.basename(fetch_result.filename)
-                                            if safe_name in ("", ".", ".."):
-                                                safe_name = "invoice_file"
-                                            invoice_path = os.path.join(temp_dir, safe_name)
-                                            with open(invoice_path, "wb") as f:
-                                                f.write(fetch_result.content)
-                                            invoice_file_paths = [invoice_path]
-                                            logger.info(f"Invoice file prepared for attachment: {fetch_result.filename} ({len(fetch_result.content)} bytes)")
+                                            if fetch_result.content_files:
+                                                # <= 5 files: attach each individually
+                                                for idx, (fname, fbytes) in enumerate(fetch_result.content_files):
+                                                    safe_name = os.path.basename(fname) or f"invoice_{idx}"
+                                                    if safe_name in ("", ".", ".."):
+                                                        safe_name = f"invoice_{idx}"
+                                                    invoice_path = os.path.join(temp_dir, safe_name)
+                                                    with open(invoice_path, "wb") as f:
+                                                        f.write(fbytes)
+                                                    invoice_file_paths.append(invoice_path)
+                                                logger.info(f"Invoice files prepared for attachment: {len(invoice_file_paths)} file(s)")
+                                            else:
+                                                # > 5 files or single file: attach ZIP/single file
+                                                safe_name = os.path.basename(fetch_result.filename)
+                                                if safe_name in ("", ".", ".."):
+                                                    safe_name = "invoice_file"
+                                                invoice_path = os.path.join(temp_dir, safe_name)
+                                                with open(invoice_path, "wb") as f:
+                                                    f.write(fetch_result.content)
+                                                invoice_file_paths = [invoice_path]
+                                                logger.info(f"Invoice file prepared for attachment: {fetch_result.filename} ({len(fetch_result.content)} bytes)")
                                         else:
                                             logger.info(f"Invoice fetch skipped/failed (non-blocking): {fetch_result.error}")
                                     else:
