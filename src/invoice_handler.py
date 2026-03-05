@@ -43,9 +43,8 @@ load_dotenv()
 # ============================================================================
 INVOICE_HANDLER_ENABLED = True
 
-# VDI file_mover URL - POST /retrieve-document; fallback when env not set
-VDI_URL = (os.getenv("VDI_URL") or os.getenv("INVOICE_FETCH_URL") or "").strip() or "http://20.102.88.158:5000/retrieve-document"
-INVOICE_FETCH_URL = VDI_URL
+# Direct VDI endpoint (same for prod & test)
+INVOICE_FETCH_URL = "http://20.185.50.145:5000/retrieve-document"
 
 # Password used by file_mover to encrypt ZIP; fallback when env not set
 _zip_password = os.getenv("ZIP_PASSWORD", "abccollect")
