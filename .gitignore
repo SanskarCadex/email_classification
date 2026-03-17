@@ -49,6 +49,10 @@ logs/
 email_processor.log
 mail_move.log
 
+# Local data and exports (do not commit)
+data_sheet/
+test/
+
 # Environment variables (CRITICAL - Never commit these!)
 .env
 .env.local

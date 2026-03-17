@@ -43,7 +43,7 @@ _last_report_date = None
 EXPORT_FORMAT = "csv"
 # Outbound event rows configuration: Only create duplicate "_with_reply" rows if email was actually sent
 # Set to True to enable outbound event rows (only for actually sent emails), False to disable completely
-ENABLE_OUTBOUND_EVENT_ROWS = False
+ENABLE_OUTBOUND_EVENT_ROWS = True
 # SFTP Configuration
 SFTP_HOST = os.getenv("SFTP_HOST")
 SFTP_PORT = int(os.getenv("SFTP_PORT", "22"))
