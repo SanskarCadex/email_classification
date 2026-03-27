@@ -44,6 +44,8 @@ COMPANY_NAME = os.getenv("COMPANY_NAME", "ABC/AMEGA")
 SEND_INVOICE_REQUEST_NO_INFO = True   # Set to True to send directly, False for draft
 SEND_CLAIMS_PAID_NO_PROOF = True      # Set to True to send directly, False for draft
 SEND_INVOICE_WITH_ATTACHMENT = False  # Set to True to send the SECOND invoice email directly, False for draft (only runs if first was sent)
+# invoice_request_with_info: always create main draft; optionally send it if enabled
+SEND_INVOICE_WITH_INFO_WITH_ATTACHMENT = False  # Set to True to send the invoice_request_with_info draft directly
 
 # Updated list of allowed labels
 ALLOWED_LABELS = [
@@ -66,6 +68,7 @@ ALLOWED_LABELS = [
 #   not a classification label returned by the model.
 RESPONSE_LABELS = [
     "invoice_request_no_info",
+    "invoice_request_with_info",
     "invoice_request_acknowledgment",
     "claims_paid_no_proof"
 ]
@@ -1439,6 +1442,151 @@ class EmailProcessor:
                                         logger.error(f"Error sending invoice main draft; leaving as draft: {e}")
                             else:
                                 logger.error(f"❌ CRITICAL: Invoice main draft NOT created after 3 attempts - email {message_id} will be processed without second draft")
+            # SPECIAL HANDLING:
+            # invoice_request_with_info should ALWAYS create a main invoice draft (optionally attach invoice)
+            # and only send if SEND_INVOICE_WITH_INFO_WITH_ATTACHMENT=True.
+            elif event_type == "invoice_request_with_info":
+                invoice_flow_handled = True
+
+                main_reply_text = self.model_api.generate_reply(
+                    subject=subject,
+                    body=clean_body,
+                    label="invoice_request_with_info",
+                    sender_name=sender_name,
+                    sender_email=sender,
+                    recipient_email=reply_recipient_email,
+                    entities=entities,
+                )
+
+                # CHECK UNIFIED STOP AFTER REPLY GENERATION
+                if self.stop_event.is_set():
+                    logger.info("STOP: Stop signal detected after reply generation - stopping NOW")
+                    return False
+
+                # ✅ VALIDATION: Check if reply was actually generated
+                if not main_reply_text or not main_reply_text.strip():
+                    logger.error("❌ CRITICAL: Reply generation FAILED for invoice_request_with_info - no reply text generated after retries")
+                    logger.error(f"   Email: {message_id}, Event Type: {event_type}, Label: invoice_request_with_info")
+                    logger.error("   This email requires a reply but none was generated - processing will continue without draft")
+                    main_reply_text = ""
+
+                if main_reply_text:
+                    logger.info(f"Invoice with-info main reply generated: {len(main_reply_text)} chars")
+                    reply_text = main_reply_text  # Persist reply text to MongoDB
+
+                    # Always create as draft first (so we can attach invoice if available)
+                    main_draft_id = self._create_draft_with_retry(message_id, main_reply_text, source_account, "invoice with info main")
+                    if main_draft_id:
+                        draft_created = True
+                        draft_id = main_draft_id
+                        logger.info(f"Invoice with-info main draft created: {main_draft_id}")
+
+                        # Try to fetch invoice(s) and attach (non-blocking if fails)
+                        invoice_file_paths: List[str] = []
+                        temp_dir = None
+                        try:
+                            if company_name and debtor_number:
+                                # Build candidates: thread-extracted first, then model's; try each until success
+                                candidates: List[Optional[str]] = []
+                                if extracted_invoice_numbers:
+                                    candidates.extend(extracted_invoice_numbers)
+                                if invoice_number and invoice_number not in candidates:
+                                    candidates.append(invoice_number)
+                                if not candidates:
+                                    candidates.append(None)
+
+                                fetch_result = None
+                                for idx, candidate in enumerate(candidates):
+                                    fetch_result = self.invoice_handler.fetch_invoices(
+                                        company_name=company_name,
+                                        abcfn_number=debtor_number,
+                                        invoice_number=candidate,
+                                    )
+                                    if fetch_result.success and (
+                                        fetch_result.content_files or (fetch_result.content and fetch_result.filename)
+                                    ):
+                                        if extracted_invoice_numbers and idx == 0:
+                                            logger.info(
+                                                "Using %d invoice number(s) extracted from thread",
+                                                len(extracted_invoice_numbers),
+                                            )
+                                        break
+                                    if idx < len(candidates) - 1:
+                                        logger.info("Invoice fetch candidate failed; trying next candidate")
+
+                                if fetch_result and fetch_result.success and (
+                                    fetch_result.content_files or (fetch_result.content and fetch_result.filename)
+                                ):
+                                    temp_dir = tempfile.mkdtemp(prefix="invoice_")
+                                    if fetch_result.content_files:
+                                        # <= 5 files: attach each individually
+                                        for fidx, (fname, fbytes) in enumerate(fetch_result.content_files):
+                                            safe_name = os.path.basename(fname) or f"invoice_{fidx}"
+                                            if safe_name in ("", ".", ".."):
+                                                safe_name = f"invoice_{fidx}"
+                                            invoice_path = os.path.join(temp_dir, safe_name)
+                                            with open(invoice_path, "wb") as f:
+                                                f.write(fbytes)
+                                            invoice_file_paths.append(invoice_path)
+                                        logger.info(f"Invoice files prepared for attachment: {len(invoice_file_paths)} file(s)")
+                                    else:
+                                        # > 5 files or single file: attach ZIP/single file
+                                        safe_name = os.path.basename(fetch_result.filename)
+                                        if safe_name in ("", ".", ".."):
+                                            safe_name = "invoice_file"
+                                        invoice_path = os.path.join(temp_dir, safe_name)
+                                        with open(invoice_path, "wb") as f:
+                                            f.write(fetch_result.content)
+                                        invoice_file_paths = [invoice_path]
+                                        logger.info(f"Invoice file prepared for attachment: {fetch_result.filename} ({len(fetch_result.content)} bytes)")
+                                else:
+                                    logger.info(f"Invoice fetch skipped/failed (non-blocking): {fetch_result.error}")
+                            else:
+                                logger.info("Invoice fetch skipped: missing company_name or debtor_number")
+
+                            if invoice_file_paths:
+                                attached_count = self.graph_client.attach_files_to_draft(
+                                    main_draft_id,
+                                    from_account=source_account,
+                                    file_paths=invoice_file_paths,
+                                )
+                                if attached_count > 0:
+                                    invoices_attached = True
+                                    invoice_count = attached_count
+                                    logger.info(f"Attached {attached_count} invoice file(s) to draft {main_draft_id}")
+                        except Exception as e:
+                            logger.warning(f"Invoice fetch/attach failed (non-blocking): {e}")
+                        finally:
+                            # cleanup temp files
+                            try:
+                                if temp_dir:
+                                    for p in invoice_file_paths:
+                                        try:
+                                            os.remove(p)
+                                        except Exception as e:
+                                            logger.debug(f"Failed to remove temp file {p}: {e}")
+                                    try:
+                                        os.rmdir(temp_dir)
+                                    except Exception as e:
+                                        logger.debug(f"Failed to remove temp dir {temp_dir}: {e}")
+                            except Exception as e:
+                                logger.debug(f"Cleanup error: {e}")
+
+                        # If configured, send the draft (with or without attachment)
+                        if SEND_INVOICE_WITH_INFO_WITH_ATTACHMENT:
+                            try:
+                                sent = self.graph_client.send_existing_draft(
+                                    main_draft_id, from_account=source_account
+                                )
+                                if sent:
+                                    email_sent_directly = True
+                                    logger.info("Invoice with-info draft sent")
+                                else:
+                                    logger.warning("Failed to send invoice with-info draft; leaving as draft")
+                            except Exception as e:
+                                logger.error(f"Error sending invoice with-info draft; leaving as draft: {e}")
+                    else:
+                        logger.error(f"❌ CRITICAL: Invoice with-info draft NOT created after 3 attempts - email {message_id} will be processed without draft")
             else:
                 # Default single-reply behavior (e.g. claims_paid_no_proof)
                 # invoice_flow_handled is already False (initialized above)
@@ -1468,9 +1616,9 @@ class EmailProcessor:
             if reply_text:
                 logger.info(f"Reply generated: {len(reply_text)} chars")
                 
-                # invoice_request_no_info is fully handled above (ack + optional main),
-                # so we MUST NOT run the default send/draft logic again.
-                if event_type == "invoice_request_no_info" and invoice_flow_handled:
+                # invoice_request_no_info / invoice_request_with_info are fully handled above,
+                # so we MUST NOT run the default send/draft logic again (would duplicate drafts).
+                if invoice_flow_handled:
                     pass
                 else:
                     # FEATURE 2: Check per-response-type sending configuration - ONLY 2 TYPES
