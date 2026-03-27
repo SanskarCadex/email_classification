@@ -558,7 +558,7 @@ def export_processed_emails_to_excel(batch_id: str, stop_event=None) -> Optional
         
         # Check if this email needs a duplicate row with reply
         has_ai_reply = bool(reply_text.strip())
-        needs_reply_duplicate = event_type_raw in ["invoice_request_no_info", "claims_paid_no_proof"]
+        needs_reply_duplicate = event_type_raw in ["invoice_request_no_info", "invoice_request_with_info", "claims_paid_no_proof"]
         
         # Only create duplicate "_with_reply" row if:
         # 1. Outbound event rows are enabled (ENABLE_OUTBOUND_EVENT_ROWS = True)
