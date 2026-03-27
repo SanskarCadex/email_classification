@@ -1,0 +1,27 @@
+name: trivy-analysis
+# dummy commit to test new changes
+on:
+  pull_request:
+    branches:
+      - develop
+      - dev
+  workflow_dispatch:
+
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  trivy-image-scan:
+    uses: dandsltd/o2c-devops/.github/workflows/trivy-analysis.yaml@develop
+    with:
+      working_directory: "."
+      dockerfile: "Dockerfile"
+      build_context: "."
+      severity: "CRITICAL,HIGH"
+      ignore_unfixed: true
+      fail_on_findings: true
+      service_name: "email-classification"
+    secrets:
+      O2C_GITHUB_TOKEN: ${{ secrets.O2C_GITHUB_TOKEN }}
